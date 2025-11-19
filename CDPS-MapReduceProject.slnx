@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="MasterNode/MasterNode.csproj" />
+  <Project Path="WorkerNode/WorkerNode.csproj" />
+</Solution>
