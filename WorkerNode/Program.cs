@@ -64,9 +64,12 @@ internal class Program
         }
 
         if (discovery is null)
+        {
+            Console.WriteLine("Here!");
             return (ConnectionState.SearchingMaster, IPAddress.None);
+        }
 
-        if (discovery.Type == "DISCOVER")
+        if (discovery.Type == "DISCOVERY")
         {
             Logger.Info("Master discovery received.");
             return (ConnectionState.CommunicatingMaster, result.RemoteEndPoint.Address);
