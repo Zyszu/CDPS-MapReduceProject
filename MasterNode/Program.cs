@@ -6,11 +6,13 @@ using System.Text.Json;
 using Shared.Logging;
 using Shared.Messages;
 using Shared.Constants;
+using Shared.Node;
 
 internal class Program
 {
-    private static readonly Dictionary<string, DateTime> _lastHeartbeat = new();
+    private static readonly Dictionary<string, Node> _nodes = new();
     private static readonly TimeSpan _heartbeatTimeout = TimeSpan.FromSeconds(7);
+    private static readonly string MasterNodeId = NodeIdProvider.GetNodeId();
 
     private static async Task Main(string[] args)
     {
@@ -60,7 +62,7 @@ internal class Program
 
         var discoveryMsg = new DiscoveryMessage
         {
-            SenderId = "Master"
+            SenderId = MasterNodeId
         };
 
         string json = JsonSerializer.Serialize(discoveryMsg);
@@ -106,9 +108,20 @@ internal class Program
             if (hb == null)
                 continue;
 
-            _lastHeartbeat[hb.NodeId] = DateTime.UtcNow;
+            if (!_nodes.ContainsKey(hb.NodeId))
+            {
+                _nodes[hb.NodeId] = new Node(
+                    NodeType.Worker,
+                    hb.HostName,
+                    hb.NodeId,
+                    result.RemoteEndPoint.Address
+                );
+            }
 
-            Logger.Info($"Heartbeat from {hb.NodeId} at {hb.IpAddress}");
+            _nodes[hb.NodeId].UpdateLastHeartbeat(DateTime.UtcNow);
+
+
+            Logger.Info($"Heartbeat from {hb.NodeId}[{result.RemoteEndPoint.Address}] at {hb.IpAddress}");
         }
     }
 
@@ -119,17 +132,15 @@ internal class Program
         {
             var now = DateTime.UtcNow;
 
-            foreach (var kvp in _lastHeartbeat.ToList())
+            foreach (var node in _nodes.Values.ToList())
             {
-                var nodeId = kvp.Key;
-                var lastSeen = kvp.Value;
-
-                if (now - lastSeen > _heartbeatTimeout)
+                if (now - node.LastHeartbeat > _heartbeatTimeout)
                 {
-                    Logger.Warn($"Worker LOST: {nodeId}");
-                    _lastHeartbeat.Remove(nodeId);
+                    Logger.Warn($"Worker lost: {node.Id} ({node.IpAddress})");
+                    _nodes.Remove(node.Id);
                 }
             }
+
 
             await Task.Delay(2000);
         }

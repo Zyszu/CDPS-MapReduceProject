@@ -2,6 +2,7 @@
 using Shared.Logging;
 using Shared.Messages;
 using Shared.Networking;
+using Shared.Node;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,6 +10,9 @@ using System.Text.Json;
 
 internal class Program
 {
+
+    private static readonly string WorkerNodeId = NodeIdProvider.GetNodeId();
+
     private static async Task Main(string[] args)
     {
         Logger.Init("Worker");
@@ -69,7 +73,7 @@ internal class Program
             return (ConnectionState.SearchingMaster, IPAddress.None);
         }
 
-        if (discovery.Type == "DISCOVERY")
+        if (discovery.Type == Messages.DiscoveryMessageString)
         {
             Logger.Info("Master discovery received.");
             return (ConnectionState.CommunicatingMaster, result.RemoteEndPoint.Address);
@@ -87,9 +91,10 @@ internal class Program
         {
             var hb = new HeartbeatMessage
             {
-                NodeId = Environment.MachineName,
-                IpAddress = masterIp.ToString(),
-                Timestamp = DateTime.UtcNow
+                HostName    = Environment.MachineName,
+                NodeId      = WorkerNodeId,
+                IpAddress   = masterIp.ToString(),
+                Timestamp   = DateTime.UtcNow
             };
 
             string json = JsonSerializer.Serialize(hb);
