@@ -15,7 +15,7 @@
           }
         },
         "build": {
-          "build/_._": {}
+          "build/Serilog.targets": {}
         }
       },
       "Serilog.Sinks.Console/6.1.1": {
@@ -48,21 +48,6 @@
           "lib/net9.0/Serilog.Sinks.File.dll": {
             "related": ".xml"
           }
-        }
-      },
-      "Shared/1.0.0": {
-        "type": "project",
-        "framework": ".NETCoreApp,Version=v10.0",
-        "dependencies": {
-          "Serilog": "4.3.0",
-          "Serilog.Sinks.Console": "6.1.1",
-          "Serilog.Sinks.File": "7.0.0"
-        },
-        "compile": {
-          "bin/placeholder/Shared.dll": {}
-        },
-        "runtime": {
-          "bin/placeholder/Shared.dll": {}
         }
       }
     }
@@ -141,16 +126,13 @@
         "serilog.sinks.file.7.0.0.nupkg.sha512",
         "serilog.sinks.file.nuspec"
       ]
-    },
-    "Shared/1.0.0": {
-      "type": "project",
-      "path": "../Shared/Shared.csproj",
-      "msbuildProject": "../Shared/Shared.csproj"
     }
   },
   "projectFileDependencyGroups": {
     "net10.0": [
-      "Shared >= 1.0.0"
+      "Serilog >= 4.3.0",
+      "Serilog.Sinks.Console >= 6.1.1",
+      "Serilog.Sinks.File >= 7.0.0"
     ]
   },
   "packageFolders": {
@@ -159,11 +141,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "/Users/mateusz/repos/CDPS-MapReduceProject/MasterNode/MasterNode.csproj",
-      "projectName": "MasterNode",
-      "projectPath": "/Users/mateusz/repos/CDPS-MapReduceProject/MasterNode/MasterNode.csproj",
+      "projectUniqueName": "/Users/mateusz/repos/CDPS-MapReduceProject/Shared/Shared.csproj",
+      "projectName": "Shared",
+      "projectPath": "/Users/mateusz/repos/CDPS-MapReduceProject/Shared/Shared.csproj",
       "packagesPath": "/Users/mateusz/.nuget/packages/",
-      "outputPath": "/Users/mateusz/repos/CDPS-MapReduceProject/MasterNode/obj/",
+      "outputPath": "/Users/mateusz/repos/CDPS-MapReduceProject/Shared/obj/",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "/Users/mateusz/.nuget/NuGet/NuGet.Config"
@@ -177,11 +159,7 @@
       "frameworks": {
         "net10.0": {
           "targetAlias": "net10.0",
-          "projectReferences": {
-            "/Users/mateusz/repos/CDPS-MapReduceProject/Shared/Shared.csproj": {
-              "projectPath": "/Users/mateusz/repos/CDPS-MapReduceProject/Shared/Shared.csproj"
-            }
-          }
+          "projectReferences": {}
         }
       },
       "warningProperties": {
@@ -199,6 +177,20 @@
     "frameworks": {
       "net10.0": {
         "targetAlias": "net10.0",
+        "dependencies": {
+          "Serilog": {
+            "target": "Package",
+            "version": "[4.3.0, )"
+          },
+          "Serilog.Sinks.Console": {
+            "target": "Package",
+            "version": "[6.1.1, )"
+          },
+          "Serilog.Sinks.File": {
+            "target": "Package",
+            "version": "[7.0.0, )"
+          }
+        },
         "imports": [
           "net461",
           "net462",

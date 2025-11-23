@@ -1,8 +1,12 @@
 {
   "version": 2,
-  "dgSpecHash": "zQ9AyD2imbA=",
+  "dgSpecHash": "qGDP0GAIXrY=",
   "success": true,
   "projectFilePath": "/Users/mateusz/repos/CDPS-MapReduceProject/MasterNode/MasterNode.csproj",
-  "expectedPackageFiles": [],
+  "expectedPackageFiles": [
+    "/Users/mateusz/.nuget/packages/serilog/4.3.0/serilog.4.3.0.nupkg.sha512",
+    "/Users/mateusz/.nuget/packages/serilog.sinks.console/6.1.1/serilog.sinks.console.6.1.1.nupkg.sha512",
+    "/Users/mateusz/.nuget/packages/serilog.sinks.file/7.0.0/serilog.sinks.file.7.0.0.nupkg.sha512"
+  ],
   "logs": []
 }
