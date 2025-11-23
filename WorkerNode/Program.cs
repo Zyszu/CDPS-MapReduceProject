@@ -69,7 +69,6 @@ internal class Program
 
         if (discovery is null)
         {
-            Console.WriteLine("Here!");
             return (ConnectionState.SearchingMaster, IPAddress.None);
         }
 
