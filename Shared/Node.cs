@@ -35,7 +35,11 @@ public class Node
 public static class NodeIdProvider
     {
         private static readonly string NodeIdPath =
-            "/var/lib/cdps/nodeid";
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "cdps",
+                "nodeid"
+            );
 
         private static string? _cached;
 

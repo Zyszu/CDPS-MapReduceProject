@@ -18,7 +18,8 @@ internal class Program
     {
         Logger.Init("Master");
 
-        Console.WriteLine("MASTER NODE STARTED");
+        Console.WriteLine($"MASTER NODE STARTED");
+        Console.WriteLine($"MASTER NODE UUID: {MasterNodeId}");
         Console.WriteLine($"Discovery broadcast on UDP port {Ports.Discovery}");
         Console.WriteLine($"Heartbeat listener on UDP port {Ports.Heartbeat}");
 
