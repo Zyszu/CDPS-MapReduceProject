@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
+using System.Linq;
 using Shared.Logging;
 using Shared.Messages;
 using Shared.Constants;
@@ -11,8 +12,10 @@ using Shared.Node;
 internal class Program
 {
     private static readonly Dictionary<string, Node> _nodes = new();
+    private static readonly object _nodesLock = new();
     private static readonly TimeSpan _heartbeatTimeout = TimeSpan.FromSeconds(7);
     private static readonly string MasterNodeId = NodeIdProvider.GetNodeId();
+    
 
     private static async Task Main(string[] args)
     {
@@ -25,15 +28,24 @@ internal class Program
 
         // Get local IPv4
         var iface = NetworkInterface.GetAllNetworkInterfaces()
-            .First(n => n.OperationalStatus == OperationalStatus.Up &&
-                        n.NetworkInterfaceType != NetworkInterfaceType.Loopback);
+            .FirstOrDefault(n =>
+                n.OperationalStatus == OperationalStatus.Up &&
+                n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                n.GetIPProperties().UnicastAddresses
+                    .Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork)
+            );
 
-        var props = iface.GetIPProperties();
-        var unicast = props.UnicastAddresses
+        if (iface == null)
+        {
+            throw new Exception("No active network interface with IPv4 found.");
+        }
+
+        var unicast = iface.GetIPProperties().UnicastAddresses
             .First(u => u.Address.AddressFamily == AddressFamily.InterNetwork);
 
         var localIp = unicast.Address;
         var mask = unicast.IPv4Mask;
+
 
         // Compute broadcast IP
         byte[] ipBytes = localIp.GetAddressBytes();
@@ -46,13 +58,13 @@ internal class Program
         var broadcastIp = new IPAddress(broadcastBytes);
         Console.WriteLine($"Broadcast IP = {broadcastIp}");
 
-        // Start async tasks
+        // Start background tasks
         _ = BroadcastDiscoveryLoop(localIp, broadcastIp);
         _ = HeartbeatListenerLoop();
         _ = LostWorkerCheckerLoop();
 
-        // Keep master alive
-        await Task.Delay(-1);
+        // Start CLI (blocks until user quits)
+        await CliLoop();
     }
 
     // DISCOVERY BROADCAST LOOP
@@ -109,17 +121,20 @@ internal class Program
             if (hb == null)
                 continue;
 
-            if (!_nodes.ContainsKey(hb.NodeId))
+            lock (_nodesLock)
             {
-                _nodes[hb.NodeId] = new Node(
-                    NodeType.Worker,
-                    hb.HostName,
-                    hb.NodeId,
-                    result.RemoteEndPoint.Address
-                );
-            }
+                if (!_nodes.ContainsKey(hb.NodeId))
+                {
+                    _nodes[hb.NodeId] = new Node(
+                        NodeType.Worker,
+                        hb.HostName,
+                        hb.NodeId,
+                        result.RemoteEndPoint.Address
+                    );
+                }
 
-            _nodes[hb.NodeId].UpdateLastHeartbeat(DateTime.UtcNow);
+                _nodes[hb.NodeId].UpdateLastHeartbeat(DateTime.UtcNow);
+            }
 
 
             Logger.Info($"Heartbeat from {hb.NodeId}[{result.RemoteEndPoint.Address}] at {hb.IpAddress}");
@@ -133,12 +148,15 @@ internal class Program
         {
             var now = DateTime.UtcNow;
 
-            foreach (var node in _nodes.Values.ToList())
+            lock (_nodesLock)
             {
-                if (now - node.LastHeartbeat > _heartbeatTimeout)
+                foreach (var node in _nodes.Values.ToList())
                 {
-                    Logger.Warn($"Worker lost: {node.Id} ({node.IpAddress})");
-                    _nodes.Remove(node.Id);
+                    if (now - node.LastHeartbeat > _heartbeatTimeout)
+                    {
+                        Logger.Warn($"Worker lost: {node.Id} ({node.IpAddress})");
+                        _nodes.Remove(node.Id);
+                    }
                 }
             }
 
@@ -146,4 +164,388 @@ internal class Program
             await Task.Delay(2000);
         }
     }
+
+    // -----------------
+    // CLI
+    // -----------------
+    private static async Task CliLoop()
+    {
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            _requestedQuit = true;
+        };
+
+        // Non-blocking, live-refresh console loop.
+        // Keeps the node count + states at the top while you type commands.
+        var input = new StringBuilder();
+        string? lastMessage = null;
+
+        Console.TreatControlCAsInput = false;
+        Console.CursorVisible = true;
+
+        var nextRender = DateTime.UtcNow;
+        while (!_requestedQuit)
+        {
+            // Render at ~4 FPS (enough to feel live, low flicker)
+            if (DateTime.UtcNow >= nextRender)
+            {
+                RenderScreen(input.ToString(), lastMessage);
+                nextRender = DateTime.UtcNow.AddMilliseconds(250);
+            }
+
+            if (Console.KeyAvailable)
+            {
+                var key = Console.ReadKey(intercept: true);
+
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    var cmd = input.ToString().Trim();
+                    input.Clear();
+
+                    if (!string.IsNullOrWhiteSpace(cmd))
+                    {
+                        lastMessage = await ExecuteCommandAsync(cmd);
+                    }
+                    else
+                    {
+                        lastMessage = null;
+                    }
+
+                    // Render immediately after command
+                    RenderScreen(input.ToString(), lastMessage);
+                }
+                else if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (input.Length > 0)
+                        input.Length -= 1;
+                }
+                else if (key.Key == ConsoleKey.Escape)
+                {
+                    input.Clear();
+                }
+                else if (!char.IsControl(key.KeyChar))
+                {
+                    input.Append(key.KeyChar);
+                }
+            }
+
+            await Task.Delay(15);
+        }
+
+        Console.Clear();
+        Console.WriteLine("Bye.");
+    }
+
+    private static volatile bool _requestedQuit = false;
+
+    private static async Task<string?> ExecuteCommandAsync(string cmd)
+    {
+        // Menu shortcuts (single key)
+        if (cmd == "1") cmd = "nodes";
+        if (cmd == "2") cmd = "load";
+        if (cmd == "3") cmd = "plan";
+        if (cmd.Equals("q", StringComparison.OrdinalIgnoreCase)) cmd = "quit";
+
+        var parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var head = parts.Length > 0 ? parts[0].ToLowerInvariant() : "";
+
+        switch (head)
+        {
+            case "help":
+            case "h":
+            case "?":
+                return "Commands: 1/nodes, 2/load (placeholder), 3/plan (placeholder), clear, help, quit";
+
+            case "nodes":
+                return DescribeNodes();
+
+            case "clear":
+            case "cls":
+                return null; // next render will clear anyway
+
+            case "load":
+                // Optionally allow path override: load ../data/out.csv
+                var path = parts.Length >= 2 ? parts[1] : "../data/out.csv";
+                return await LoadAndDistributeAsync(path);
+
+            case "plan":
+                return "Stage planning is not implemented yet.";
+
+            case "quit":
+            case "exit":
+                _requestedQuit = true;
+                return "Exiting...";
+
+            default:
+                return $"Unknown command: '{cmd}'. Type 'help'.";
+        }
+    }
+
+    private static void RenderScreen(string currentInput, string? lastMessage)
+    {
+        Console.Clear();
+
+        var now = DateTime.UtcNow;
+        var snapshot = GetNodeSnapshot(now);
+
+        Console.WriteLine($"MASTER {MasterNodeId}");
+        Console.WriteLine($"Workers: {snapshot.Count}   (Heartbeat timeout: {_heartbeatTimeout.TotalSeconds:0}s)   UTC: {now:HH:mm:ss}");
+        Console.WriteLine(new string('-', Math.Max(20, Console.WindowWidth - 1)));
+
+        if (snapshot.Count == 0)
+        {
+            Console.WriteLine("No active workers (waiting for heartbeats)...");
+        }
+        else
+        {
+            // Small table
+            Console.WriteLine("ID (short)        IP               Host                Last seen   State");
+            Console.WriteLine("---------------------------------------------------------------");
+            foreach (var n in snapshot.OrderBy(s => s.State).ThenBy(s => s.SecondsSinceLastSeen))
+            {
+                Console.WriteLine($"{n.ShortId,-15} {n.Ip,-16} {TrimTo(n.Host, 18),-18} {n.SecondsSinceLastSeen,6:0.0}s   {n.State}");
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Menu: [1] nodes   [2] load   [3] plan   [help]   [q] quit");
+        Console.WriteLine();
+
+        if (!string.IsNullOrWhiteSpace(lastMessage))
+        {
+            Console.WriteLine($"> {lastMessage}");
+            Console.WriteLine();
+        }
+
+        Console.Write("> ");
+        Console.Write(currentInput);
+    }
+
+    private static string DescribeNodes()
+    {
+        var snapshot = GetNodeSnapshot(DateTime.UtcNow);
+        if (snapshot.Count == 0) return "No active workers.";
+
+        var healthy = snapshot.Count(s => s.State == NodeUiState.Healthy);
+        var stale = snapshot.Count(s => s.State == NodeUiState.Stale);
+        return $"Workers: {snapshot.Count} (Healthy: {healthy}, Stale: {stale}).";
+    }
+
+    private static List<NodeSnapshot> GetNodeSnapshot(DateTime now)
+    {
+        lock (_nodesLock)
+        {
+            return _nodes.Values
+                .Select(n =>
+                {
+                    var age = now - n.LastHeartbeat;
+                    var state = age.TotalSeconds <= 2
+                        ? NodeUiState.Healthy
+                        : NodeUiState.Stale;
+
+                    return new NodeSnapshot(
+                        ShortId: n.Id.Length > 12 ? n.Id[..12] : n.Id,
+                        Ip: n.IpAddress?.ToString() ?? "?",
+                        Host: n.HostName ?? "?",
+                        SecondsSinceLastSeen: (float)age.TotalSeconds,
+                        State: state
+                    );
+                })
+                .ToList();
+        }
+    }
+
+    private static string TrimTo(string s, int max)
+        => s.Length <= max ? s : s[..Math.Max(0, max - 1)] + "…";
+
+    private enum NodeUiState
+    {
+        Healthy = 0,
+        Stale = 1,
+    }
+
+    private sealed record NodeSnapshot(
+        string ShortId,
+        string Ip,
+        string Host,
+        float SecondsSinceLastSeen,
+        NodeUiState State
+    );
+
+
+
+
+
+    private static async Task WriteFrameAsync(NetworkStream stream, byte[] payload, CancellationToken ct)
+    {
+        byte[] len = BitConverter.GetBytes(payload.Length);
+        await stream.WriteAsync(len, 0, len.Length, ct);
+        await stream.WriteAsync(payload, 0, payload.Length, ct);
+        await stream.FlushAsync(ct);
+    }
+
+    private static async Task<byte[]> ReadFrameAsync(NetworkStream stream, CancellationToken ct)
+    {
+        byte[] lenBuf = new byte[4];
+        int read = 0;
+        while (read < 4)
+        {
+            int r = await stream.ReadAsync(lenBuf, read, 4 - read, ct);
+            if (r == 0) throw new IOException("Stream closed while reading length.");
+            read += r;
+        }
+
+        int len = BitConverter.ToInt32(lenBuf, 0);
+        if (len <= 0 || len > 100_000_000) throw new IOException($"Invalid frame length: {len}");
+
+        byte[] payload = new byte[len];
+        int offset = 0;
+        while (offset < len)
+        {
+            int r = await stream.ReadAsync(payload, offset, len - offset, ct);
+            if (r == 0) throw new IOException("Stream closed while reading payload.");
+            offset += r;
+        }
+        return payload;
+    }
+
+    private static string ComputeSha256OfLines(string[] lines)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var text = string.Join("\n", lines ?? Array.Empty<string>());
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var hash = sha.ComputeHash(bytes);
+        return Convert.ToHexString(hash);
+    }
+
+
+
+        private static async Task<string> LoadAndDistributeAsync(string csvPath)
+    {
+        List<Node> workers;
+        lock (_nodesLock)
+        {
+            workers = _nodes.Values.ToList();
+        }
+
+        if (workers.Count == 0)
+            return "Cannot load: no active workers.";
+
+        if (!File.Exists(csvPath))
+            return $"File not found: {csvPath}";
+
+        var allLines = await File.ReadAllLinesAsync(csvPath);
+        if (allLines.Length <= 1)
+            return "CSV has no data rows.";
+
+        // Keep header (optional for later), chunk only data lines
+        var header = allLines[0];
+        var dataLines = allLines.Skip(1).ToArray();
+
+        // Equal chunks by row count
+        int n = workers.Count;
+        var chunks = SplitIntoChunks(dataLines, n);
+
+        var jobId = Guid.NewGuid().ToString("N");
+
+        // Send in parallel (one chunk per worker)
+        var tasks = new List<Task<(string workerId, bool ok, string msg)>>();
+        for (int i = 0; i < n; i++)
+        {
+            var worker = workers[i];
+            var chunkLines = chunks[i];
+            int chunkId = i;
+
+            tasks.Add(SendChunkToWorkerAsync(worker, jobId, chunkId, n, chunkLines));
+        }
+
+        var results = await Task.WhenAll(tasks);
+
+        int okCount = results.Count(r => r.ok);
+        var errors = results.Where(r => !r.ok).ToList();
+
+        if (errors.Count == 0)
+            return $"Loaded {dataLines.Length} rows and distributed to {okCount}/{n} workers. JobId={jobId}";
+
+        var errText = string.Join(" | ", errors.Select(e => $"{e.workerId}: {e.msg}"));
+        return $"Partial failure: {okCount}/{n} workers OK. Errors: {errText}";
+    }
+
+    private static string[][] SplitIntoChunks(string[] lines, int chunks)
+    {
+        var result = new string[chunks][];
+        int total = lines.Length;
+        int baseSize = total / chunks;
+        int rem = total % chunks;
+
+        int offset = 0;
+        for (int i = 0; i < chunks; i++)
+        {
+            int size = baseSize + (i < rem ? 1 : 0);
+            result[i] = lines.Skip(offset).Take(size).ToArray();
+            offset += size;
+        }
+        return result;
+    }
+
+    private static async Task<(string workerId, bool ok, string msg)> SendChunkToWorkerAsync(
+        Node worker,
+        string jobId,
+        int chunkId,
+        int totalChunks,
+        string[] lines)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+            await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+
+            using var stream = client.GetStream();
+
+            var sha = ComputeSha256OfLines(lines);
+
+            var msg = new DataChunkMessage
+            {
+                JobId = jobId,
+                ChunkId = chunkId,
+                TotalChunks = totalChunks,
+                Lines = lines,
+                RowCount = lines.Length,
+                Sha256 = sha
+            };
+
+            var json = JsonSerializer.Serialize(msg);
+            var bytes = Encoding.UTF8.GetBytes(json);
+
+            await WriteFrameAsync(stream, bytes, cts.Token);
+
+            // Read ACK and verify
+            var ackFrame = await ReadFrameAsync(stream, cts.Token);
+            var ackJson = Encoding.UTF8.GetString(ackFrame);
+            var ack = JsonSerializer.Deserialize<DataChunkAckMessage>(ackJson);
+
+            if (ack == null || ack.Type != Shared.Constants.Messages.DataChunkAckMessageString)
+                return (worker.Id, false, "Invalid ACK.");
+
+            if (!ack.Ok)
+                return (worker.Id, false, $"Worker rejected chunk: {ack.Error}");
+
+            if (ack.JobId != jobId || ack.ChunkId != chunkId)
+                return (worker.Id, false, "ACK jobId/chunkId mismatch.");
+
+            if (ack.RowCount != lines.Length || ack.Sha256 != sha)
+                return (worker.Id, false, "ACK integrity mismatch (hash/rowCount).");
+
+            return (worker.Id, true, "OK");
+        }
+        catch (Exception ex)
+        {
+            return (worker.Id, false, ex.Message);
+        }
+    }
+
+
 }

@@ -11,4 +11,7 @@ public static class Messages
 {
     public const string DiscoveryMessageString = "DISCOVERY";
     public const string HeartbeatMessageString = "HEARTHBEAT";
+
+    public const string DataChunkMessageString = "DATA_CHUNK";
+    public const string DataChunkAckMessageString = "DATA_CHUNK_ACK";
 }
