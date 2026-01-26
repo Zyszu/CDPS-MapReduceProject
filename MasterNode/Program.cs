@@ -352,9 +352,9 @@ internal class Program
     }
 
     private static async Task<(string workerId, bool ok, string msg, int pairs)> SendMapRequestToWorkerAsync(
-        Node worker,
-        JobSpec job,
-        int chunkId)
+    Node worker,
+    JobSpec job,
+    int chunkId)
     {
         try
         {
@@ -364,39 +364,68 @@ internal class Program
             await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
             using var stream = client.GetStream();
 
+            // 1) Send MAP_REQUEST
             var req = new MapRequestMessage
             {
+                Type = Shared.Constants.Messages.MapRequestMessageString, // IMPORTANT if Type is settable
                 Job = job,
                 ChunkId = chunkId
             };
 
-            var json = JsonSerializer.Serialize(req);
-            var bytes = Encoding.UTF8.GetBytes(json);
+            var reqJson = JsonSerializer.Serialize(req);
+            var reqBytes = Encoding.UTF8.GetBytes(reqJson);
 
-            await WriteFrameAsync(stream, bytes, cts.Token);
+            await WriteFrameAsync(stream, reqBytes, cts.Token);
 
-            // Read MAP_RESULT
+            // 2) Read response
             var resFrame = await ReadFrameAsync(stream, cts.Token);
             var resJson = Encoding.UTF8.GetString(resFrame);
 
-            var res = JsonSerializer.Deserialize<MapResultMessage>(resJson);
-            if (res == null || res.Type != Shared.Constants.Messages.MapResultMessageString)
-                return (worker.Id, false, "Invalid MAP_RESULT.", 0);
+            // 3) Inspect "Type" before deserializing into a concrete class
+            using var doc = JsonDocument.Parse(resJson);
+            if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                return (worker.Id, false, "Response missing Type field.", 0);
 
-            if (!res.Ok)
-                return (worker.Id, false, $"Worker MAP error: {res.Error}", 0);
+            var type = typeProp.GetString();
 
-            if (res.JobId != job.JobId || res.ChunkId != chunkId)
-                return (worker.Id, false, "MAP_RESULT jobId/chunkId mismatch.", 0);
+            // 4) Handle MAP_RESULT
+            if (type == Shared.Constants.Messages.MapResultMessageString)
+            {
+                var res = JsonSerializer.Deserialize<MapResultMessage>(resJson);
+                if (res == null)
+                    return (worker.Id, false, "Invalid MAP_RESULT JSON.", 0);
 
-            int pairs = res.Pairs?.Length ?? 0;
-            return (worker.Id, true, "OK", pairs);
+                if (!res.Ok)
+                    return (worker.Id, false, $"Worker MAP error: {res.Error}", 0);
+
+                if (!string.Equals(res.JobId, job.JobId, StringComparison.Ordinal) || res.ChunkId != chunkId)
+                    return (worker.Id, false, $"MAP_RESULT mismatch (jobId/chunkId). Got jobId={res.JobId}, chunkId={res.ChunkId}", 0);
+
+                int pairs = res.Pairs?.Length ?? 0;
+                return (worker.Id, true, "OK", pairs);
+            }
+
+            // 5) If worker returns DATA_CHUNK_ACK during MAP, report clearly
+            if (type == Shared.Constants.Messages.DataChunkAckMessageString)
+            {
+                var ack = JsonSerializer.Deserialize<DataChunkAckMessage>(resJson);
+                if (ack == null)
+                    return (worker.Id, false, "Invalid DATA_CHUNK_ACK JSON.", 0);
+
+                return (worker.Id, false,
+                    $"Worker returned DATA_CHUNK_ACK during MAP (unexpected). Ok={ack.Ok}, Error={ack.Error}",
+                    0);
+            }
+
+            // 6) Unknown response type
+            return (worker.Id, false, $"Unknown response Type: {type}", 0);
         }
         catch (Exception ex)
         {
             return (worker.Id, false, ex.Message, 0);
         }
     }
+
 
     private static void RenderScreen(string currentInput, string? lastMessage)
     {
