@@ -18,4 +18,10 @@ public static class Messages
     // MapReduce
     public const string MapRequestMessageString = "MAP_REQUEST";
     public const string MapResultMessageString = "MAP_RESULT";
+
+    public const string ShufflePartitionMessageString = "SHUFFLE_PARTITION";
+    public const string ShuffleAckMessageString = "SHUFFLE_ACK";
+    public const string ReduceRequestMessageString = "REDUCE_REQUEST";
+    public const string ReduceResultMessageString = "REDUCE_RESULT";
+
 }

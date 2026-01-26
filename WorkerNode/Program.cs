@@ -18,6 +18,13 @@ internal class Program
     private static readonly object _dataLock = new();
     private static volatile string? _currentJobId = null;
 
+    // JobId -> (genre,movieId) -> (sum,count,title)
+    private static readonly Dictionary<string, Dictionary<(string genre, int movieId), (double sum, int count, string title)>> _shuffleStore
+        = new();
+
+    private static readonly object _shuffleLock = new();
+
+
 
     private static async Task Main(string[] args)
     {
@@ -60,6 +67,67 @@ internal class Program
 
         }
     }
+
+    private static List<GenreTopMovie> ReduceToTopN(string jobId, int topN)
+    {
+        Dictionary<(string genre, int movieId), (double sum, int count, string title)> dict;
+
+        lock (_shuffleLock)
+        {
+            if (!_shuffleStore.TryGetValue(jobId, out var stored))
+                return new List<GenreTopMovie>();
+
+            // Copy so we can release lock quickly
+            dict = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>(stored);
+        }
+
+        // Compute avg per key, then topN per genre
+        var perGenre = new Dictionary<string, List<GenreTopMovie>>();
+
+        foreach (var kv in dict)
+        {
+            var genre = kv.Key.genre;
+            var movieId = kv.Key.movieId;
+            var sum = kv.Value.sum;
+            var count = kv.Value.count;
+            var title = kv.Value.title;
+
+            if (count <= 0) continue;
+
+            var item = new GenreTopMovie
+            {
+                Genre = genre,
+                MovieId = movieId,
+                Title = title,
+                AvgRating = sum / count,
+                CountRatings = count
+            };
+
+            if (!perGenre.TryGetValue(genre, out var list))
+            {
+                list = new List<GenreTopMovie>();
+                perGenre[genre] = list;
+            }
+
+            list.Add(item);
+        }
+
+        var result = new List<GenreTopMovie>();
+
+        foreach (var (genre, list) in perGenre)
+        {
+            var top = list
+                .OrderByDescending(x => x.AvgRating)
+                .ThenByDescending(x => x.CountRatings)
+                .ThenBy(x => x.MovieId)
+                .Take(topN);
+
+            result.AddRange(top);
+        }
+
+        return result;
+    }
+
 
     private static string[] ParseCsvLine(string line)
     {
@@ -370,6 +438,73 @@ internal class Program
                                 await WriteFrameAsync(stream, ackBytes, cts.Token);
                                 break;
                             }
+
+                            case Shared.Constants.Messages.ShufflePartitionMessageString:
+                            {
+                                var msg = JsonSerializer.Deserialize<ShufflePartitionMessage>(json);
+                                if (msg == null) throw new Exception("Invalid SHUFFLE_PARTITION message.");
+                                if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("SHUFFLE_PARTITION missing JobId.");
+
+                                int received = 0;
+
+                                lock (_shuffleLock)
+                                {
+                                    if (!_shuffleStore.TryGetValue(msg.JobId, out var store))
+                                    {
+                                        store = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>();
+                                        _shuffleStore[msg.JobId] = store;
+                                    }
+
+                                    foreach (var p in msg.Pairs ?? Array.Empty<CombinedPair>())
+                                    {
+                                        var key = (p.Genre, p.MovieId);
+
+                                        if (store.TryGetValue(key, out var agg))
+                                            store[key] = (agg.sum + p.SumRatings, agg.count + p.CountRatings, string.IsNullOrEmpty(agg.title) ? p.Title : agg.title);
+                                        else
+                                            store[key] = (p.SumRatings, p.CountRatings, p.Title ?? "");
+
+                                        received++;
+                                    }
+                                }
+
+                                var ack = new ShuffleAckMessage
+                                {
+                                    JobId = msg.JobId,
+                                    ReducerIndex = msg.ReducerIndex,
+                                    ReceivedPairs = received,
+                                    Ok = true
+                                };
+
+                                Logger.Info($"SHUFFLE stored job={msg.JobId} reducer={msg.ReducerIndex} received={received}");
+
+                                var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
+                                await WriteFrameAsync(stream, ackBytes, cts.Token);
+                                break;
+                            }
+
+                            case Shared.Constants.Messages.ReduceRequestMessageString:
+                            {
+                                var req = JsonSerializer.Deserialize<ReduceRequestMessage>(json);
+                                if (req == null) throw new Exception("Invalid REDUCE_REQUEST message.");
+                                if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("REDUCE_REQUEST missing JobId.");
+
+                                var top = ReduceToTopN(req.Job.JobId, req.Job.TopN);
+
+                                var res = new ReduceResultMessage
+                                {
+                                    JobId = req.Job.JobId,
+                                    Top = top.ToArray(),
+                                    Ok = true
+                                };
+
+                                Logger.Info($"REDUCE done job={res.JobId} returned={res.Top.Length}");
+
+                                var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
+                                await WriteFrameAsync(stream, resBytes, cts.Token);
+                                break;
+                            }
+
 
                             case Shared.Constants.Messages.MapRequestMessageString:
                             {

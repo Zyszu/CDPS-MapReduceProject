@@ -269,9 +269,11 @@ internal class Program
                 return null; // next render will clear anyway
 
             case "load":
+            {
                 // Optionally allow path override: load ../data/out.csv
                 var path = parts.Length >= 2 ? parts[1] : "../data/out.csv";
                 return await LoadAndDistributeAsync(path);
+            }
 
             case "plan":
                 return "Stage planning is not implemented yet.";
@@ -281,6 +283,7 @@ internal class Program
                 _requestedQuit = true;
                 return "Exiting...";
             case "map":
+            {
                 int topN = 10;
                 long? fromTs = null;
                 long? toTs = null;
@@ -295,12 +298,261 @@ internal class Program
                     toTs = parsedTo;
 
                 return await MapPhaseAsync(topN, fromTs, toTs);
+            }
+            case "run":
+            {
+                // run <path> [topN] [fromTs] [toTs]
+                if (parts.Length < 2) return "Usage: run <csvPath> [topN] [fromTs] [toTs]";
+
+                string path = parts[1];
+                int topN = (parts.Length >= 3 && int.TryParse(parts[2], out var t)) ? t : 10;
+                long? fromTs = (parts.Length >= 4 && long.TryParse(parts[3], out var f)) ? f : null;
+                long? toTs = (parts.Length >= 5 && long.TryParse(parts[4], out var to)) ? to : null;
+
+                return await RunMapReduceAsync(path, topN, fromTs, toTs);
+            }
 
 
             default:
                 return $"Unknown command: '{cmd}'. Type 'help'.";
         }
     }
+
+    private static int PartitionFor(string genre, int movieId, int reducers)
+    {
+        // stable hash: use string + movieId
+        unchecked
+        {
+            int h = 17;
+            h = (h * 31) + genre.GetHashCode(StringComparison.Ordinal);
+            h = (h * 31) + movieId.GetHashCode();
+            h = h & 0x7fffffff;
+            return h % reducers;
+        }
+    }
+
+    private static async Task<string> RunMapReduceAsync(string csvPath, int topN, long? fromTs, long? toTs)
+    {
+        // 1) Load (your existing function)
+        var loadRes = await LoadAndDistributeAsync(csvPath);
+        Logger.Info(loadRes);
+
+        // Pull job info
+        string? jobId;
+        List<Node> workers;
+        int n;
+
+        lock (_jobLock)
+        {
+            jobId = _lastLoadedJobId;
+            workers = _lastLoadedWorkers.ToList();
+            n = _lastLoadedTotalChunks;
+        }
+
+        if (string.IsNullOrWhiteSpace(jobId) || workers.Count == 0 || n == 0)
+            return "Load did not set a valid job state; cannot run.";
+
+        var job = new JobSpec { JobId = jobId, TopN = topN, FromTimestamp = fromTs, ToTimestamp = toTs };
+
+        // 2) MAP: collect all CombinedPairs from all workers
+        var mapTasks = new List<Task<(string wid, bool ok, string msg, CombinedPair[] pairs)>>();
+        for (int i = 0; i < workers.Count; i++)
+        {
+            int chunkId = i;
+            mapTasks.Add(SendMapRequestToWorkerReturnPairsAsync(workers[i], job, chunkId));
+        }
+
+        var mapResults = await Task.WhenAll(mapTasks);
+        var mapErrors = mapResults.Where(r => !r.ok).ToList();
+        if (mapErrors.Count > 0)
+            return "MAP failed: " + string.Join(" | ", mapErrors.Select(e => $"{e.wid}: {e.msg}"));
+
+        var allPairs = mapResults.SelectMany(r => r.pairs ?? Array.Empty<CombinedPair>()).ToArray();
+        Logger.Info($"MAP collected combined pairs: {allPairs.Length}");
+
+        // 3) SHUFFLE: partition pairs and send to reducers (reducers = workers.Count)
+        int reducers = workers.Count;
+        var buckets = new List<CombinedPair>[reducers];
+        for (int i = 0; i < reducers; i++) buckets[i] = new List<CombinedPair>();
+
+        foreach (var p in allPairs)
+        {
+            int idx = PartitionFor(p.Genre, p.MovieId, reducers);
+            buckets[idx].Add(p);
+        }
+
+        var shuffleTasks = new List<Task<(string wid, bool ok, string msg, int received)>>();
+        for (int r = 0; r < reducers; r++)
+        {
+            shuffleTasks.Add(SendShuffleToReducerAsync(workers[r], jobId, r, buckets[r].ToArray()));
+        }
+
+        var shuffleResults = await Task.WhenAll(shuffleTasks);
+        var shuffleErrors = shuffleResults.Where(s => !s.ok).ToList();
+        if (shuffleErrors.Count > 0)
+            return "SHUFFLE failed: " + string.Join(" | ", shuffleErrors.Select(e => $"{e.wid}: {e.msg}"));
+
+        Logger.Info($"SHUFFLE complete. Sent total pairs: {allPairs.Length}");
+
+        // 4) REDUCE: ask each reducer for topN-per-genre results
+        var reduceTasks = workers.Select(w => SendReduceRequestAsync(w, job)).ToArray();
+        var reduceResults = await Task.WhenAll(reduceTasks);
+
+        var reduceErrors = reduceResults.Where(r => !r.ok).ToList();
+        if (reduceErrors.Count > 0)
+            return "REDUCE failed: " + string.Join(" | ", reduceErrors.Select(e => $"{e.wid}: {e.msg}"));
+
+        var allTop = reduceResults.SelectMany(r => r.top ?? Array.Empty<GenreTopMovie>()).ToList();
+
+        // 5) FINAL merge: topN per genre across reducers
+        var finalPerGenre = allTop
+            .GroupBy(x => x.Genre)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderByDescending(x => x.AvgRating)
+                    .ThenByDescending(x => x.CountRatings)
+                    .ThenBy(x => x.MovieId)
+                    .Take(topN)
+                    .ToList()
+            );
+
+        // 6) Print (simple text)
+        var sb = new StringBuilder();
+        sb.AppendLine($"JobId={jobId}  TopN={topN}  Workers={workers.Count}");
+        if (fromTs.HasValue || toTs.HasValue)
+            sb.AppendLine($"Time filter: from={fromTs?.ToString() ?? "-"} to={toTs?.ToString() ?? "-"}");
+        sb.AppendLine();
+
+        foreach (var genre in finalPerGenre.Keys.OrderBy(x => x))
+        {
+            sb.AppendLine($"== {genre} ==");
+            int rank = 1;
+            foreach (var item in finalPerGenre[genre])
+            {
+                sb.AppendLine($"{rank,2}. {item.Title} (movieId={item.MovieId}) avg={item.AvgRating:F3} n={item.CountRatings}");
+                rank++;
+            }
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private static async Task<(string wid, bool ok, string msg, CombinedPair[] pairs)> SendMapRequestToWorkerReturnPairsAsync(
+        Node worker, JobSpec job, int chunkId)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var req = new MapRequestMessage { Type = Messages.MapRequestMessageString, Job = job, ChunkId = chunkId };
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+            var resFrame = await ReadFrameAsync(stream, cts.Token);
+            var resJson = Encoding.UTF8.GetString(resFrame);
+
+            using var doc = JsonDocument.Parse(resJson);
+            if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                return (worker.Id, false, "Response missing Type.", Array.Empty<CombinedPair>());
+
+            var type = typeProp.GetString();
+            if (type != Messages.MapResultMessageString)
+                return (worker.Id, false, $"Unexpected response Type={type}", Array.Empty<CombinedPair>());
+
+            var res = JsonSerializer.Deserialize<MapResultMessage>(resJson);
+            if (res == null) return (worker.Id, false, "Invalid MAP_RESULT.", Array.Empty<CombinedPair>());
+            if (!res.Ok) return (worker.Id, false, res.Error, Array.Empty<CombinedPair>());
+
+            return (worker.Id, true, "OK", res.Pairs ?? Array.Empty<CombinedPair>());
+        }
+        catch (Exception ex)
+        {
+            return (worker.Id, false, ex.Message, Array.Empty<CombinedPair>());
+        }
+    }
+
+    private static async Task<(string wid, bool ok, string msg, int received)> SendShuffleToReducerAsync(
+        Node reducer, string jobId, int reducerIndex, CombinedPair[] pairs)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var msg = new ShufflePartitionMessage
+            {
+                Type = Messages.ShufflePartitionMessageString,
+                JobId = jobId,
+                ReducerIndex = reducerIndex,
+                Pairs = pairs
+            };
+
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg)), cts.Token);
+
+            var ackFrame = await ReadFrameAsync(stream, cts.Token);
+            var ackJson = Encoding.UTF8.GetString(ackFrame);
+
+            using var doc = JsonDocument.Parse(ackJson);
+            if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                return (reducer.Id, false, "Shuffle response missing Type.", 0);
+
+            var type = typeProp.GetString();
+            if (type != Messages.ShuffleAckMessageString)
+                return (reducer.Id, false, $"Unexpected shuffle response Type={type}", 0);
+
+            var ack = JsonSerializer.Deserialize<ShuffleAckMessage>(ackJson);
+            if (ack == null) return (reducer.Id, false, "Invalid SHUFFLE_ACK.", 0);
+            if (!ack.Ok) return (reducer.Id, false, ack.Error, 0);
+
+            return (reducer.Id, true, "OK", ack.ReceivedPairs);
+        }
+        catch (Exception ex)
+        {
+            return (reducer.Id, false, ex.Message, 0);
+        }
+    }
+
+    private static async Task<(string wid, bool ok, string msg, GenreTopMovie[] top)> SendReduceRequestAsync(
+        Node reducer, JobSpec job)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var req = new ReduceRequestMessage { Type = Messages.ReduceRequestMessageString, Job = job };
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+            var resFrame = await ReadFrameAsync(stream, cts.Token);
+            var resJson = Encoding.UTF8.GetString(resFrame);
+
+            using var doc = JsonDocument.Parse(resJson);
+            if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                return (reducer.Id, false, "Reduce response missing Type.", Array.Empty<GenreTopMovie>());
+
+            var type = typeProp.GetString();
+            if (type != Messages.ReduceResultMessageString)
+                return (reducer.Id, false, $"Unexpected reduce response Type={type}", Array.Empty<GenreTopMovie>());
+
+            var res = JsonSerializer.Deserialize<ReduceResultMessage>(resJson);
+            if (res == null) return (reducer.Id, false, "Invalid REDUCE_RESULT.", Array.Empty<GenreTopMovie>());
+            if (!res.Ok) return (reducer.Id, false, res.Error, Array.Empty<GenreTopMovie>());
+
+            return (reducer.Id, true, "OK", res.Top ?? Array.Empty<GenreTopMovie>());
+        }
+        catch (Exception ex)
+        {
+            return (reducer.Id, false, ex.Message, Array.Empty<GenreTopMovie>());
+        }
+    }
+
 
     private static async Task<string> MapPhaseAsync(int topN, long? fromTimestamp, long? toTimestamp)
     {
@@ -454,7 +706,7 @@ internal class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine("Menu: [1] nodes   [2] load   [3] plan [map] map [help]   [q] quit");
+        Console.WriteLine("Menu: [1] nodes   [2] load   [3] plan [map] map [run] run [help]   [q] quit");
         Console.WriteLine();
 
         if (!string.IsNullOrWhiteSpace(lastMessage))

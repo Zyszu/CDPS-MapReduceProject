@@ -87,3 +87,50 @@ public class MapResultMessage
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "";
 }
+
+public class ShufflePartitionMessage
+{
+    public string Type { get; set; } = Messages.ShufflePartitionMessageString;
+
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }   // which reducer (0..R-1)
+    public CombinedPair[] Pairs { get; set; } = Array.Empty<CombinedPair>();
+}
+
+public class ShuffleAckMessage
+{
+    public string Type { get; set; } = Messages.ShuffleAckMessageString;
+
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }
+    public int ReceivedPairs { get; set; }
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class ReduceRequestMessage
+{
+    public string Type { get; set; } = Messages.ReduceRequestMessageString;
+
+    public JobSpec Job { get; set; } = new();
+}
+
+public class GenreTopMovie
+{
+    public string Genre { get; set; } = "";
+    public int MovieId { get; set; }
+    public string Title { get; set; } = "";
+    public double AvgRating { get; set; }
+    public int CountRatings { get; set; }
+}
+
+public class ReduceResultMessage
+{
+    public string Type { get; set; } = Messages.ReduceResultMessageString;
+
+    public string JobId { get; set; } = "";
+    public GenreTopMovie[] Top { get; set; } = Array.Empty<GenreTopMovie>();
+
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
