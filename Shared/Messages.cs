@@ -48,3 +48,42 @@ public class DataChunkAckMessage
     public bool Ok { get; set; }
     public string Error { get; set; } = "";
 }
+
+public class JobSpec
+{
+    public string JobId { get; set; } = "";
+    public int TopN { get; set; } = 10;
+
+    // Optional timestamp filter (unix seconds)
+    public long? FromTimestamp { get; set; }
+    public long? ToTimestamp { get; set; }
+}
+
+public class CombinedPair
+{
+    public string Genre { get; set; } = "";
+    public int MovieId { get; set; }
+    public double SumRatings { get; set; }
+    public int CountRatings { get; set; }
+
+    // Optional but very handy for output
+    public string Title { get; set; } = "";
+}
+
+public class MapRequestMessage
+{
+    public string Type { get; set; } = Messages.MapRequestMessageString;
+
+    public JobSpec Job { get; set; } = new();
+    public int ChunkId { get; set; }
+}
+
+public class MapResultMessage
+{
+    public string Type { get; set; } = Messages.MapResultMessageString;
+    public string JobId { get; set; } = "";
+    public int ChunkId { get; set; }
+    public CombinedPair[] Pairs { get; set; } = Array.Empty<CombinedPair>();
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}

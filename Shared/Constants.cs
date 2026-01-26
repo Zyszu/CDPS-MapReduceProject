@@ -14,4 +14,8 @@ public static class Messages
 
     public const string DataChunkMessageString = "DATA_CHUNK";
     public const string DataChunkAckMessageString = "DATA_CHUNK_ACK";
+
+    // MapReduce
+    public const string MapRequestMessageString = "MAP_REQUEST";
+    public const string MapResultMessageString = "MAP_RESULT";
 }

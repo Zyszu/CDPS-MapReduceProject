@@ -7,6 +7,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
+
 
 internal class Program
 {
@@ -58,6 +60,136 @@ internal class Program
 
         }
     }
+
+    private static string[] ParseCsvLine(string line)
+    {
+        var fields = new List<string>();
+        var sb = new StringBuilder();
+        bool inQuotes = false;
+
+        for (int i = 0; i < line.Length; i++)
+        {
+            char c = line[i];
+
+            if (inQuotes)
+            {
+                if (c == '"')
+                {
+                    // Escaped quote?
+                    if (i + 1 < line.Length && line[i + 1] == '"')
+                    {
+                        sb.Append('"');
+                        i++; // skip next quote
+                    }
+                    else
+                    {
+                        inQuotes = false;
+                    }
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            else
+            {
+                if (c == '"')
+                {
+                    inQuotes = true;
+                }
+                else if (c == ',')
+                {
+                    fields.Add(sb.ToString());
+                    sb.Clear();
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+        }
+
+        fields.Add(sb.ToString());
+        return fields.ToArray();
+    }
+
+    private static List<CombinedPair> MapChunk(JobSpec job, string[] lines)
+    {
+        // Combiner: (genre,movieId) -> (sum,count,title)
+        var dict = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>();
+
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+
+            var cols = ParseCsvLine(line);
+
+            // Expect: userId,movieId,rating,timestamp,title,genres
+            if (cols.Length < 6)
+                continue;
+
+            // Header safety
+            if (cols[0].Equals("userId", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (!int.TryParse(cols[1], out int movieId))
+                continue;
+
+            if (!double.TryParse(cols[2], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double rating))
+                continue;
+
+            if (!long.TryParse(cols[3], out long ts))
+                continue;
+
+            // Timestamp filter (optional)
+            if (job.FromTimestamp.HasValue && ts < job.FromTimestamp.Value)
+                continue;
+            if (job.ToTimestamp.HasValue && ts > job.ToTimestamp.Value)
+                continue;
+
+            string title = cols[4] ?? "";
+
+            string genresRaw = cols[5] ?? "";
+            if (string.IsNullOrWhiteSpace(genresRaw))
+                continue;
+
+            var genres = genresRaw.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var genre in genres)
+            {
+                if (genre.Equals("(no genres listed)", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var key = (genre, movieId);
+
+                if (dict.TryGetValue(key, out var agg))
+                {
+                    dict[key] = (agg.sum + rating, agg.count + 1, string.IsNullOrEmpty(agg.title) ? title : agg.title);
+                }
+                else
+                {
+                    dict[key] = (rating, 1, title);
+                }
+            }
+        }
+
+        var results = new List<CombinedPair>(dict.Count);
+        foreach (var kv in dict)
+        {
+            results.Add(new CombinedPair
+            {
+                Genre = kv.Key.genre,
+                MovieId = kv.Key.movieId,
+                SumRatings = kv.Value.sum,
+                CountRatings = kv.Value.count,
+                Title = kv.Value.title
+            });
+        }
+
+        return results;
+    }
+
 
     private static async Task<(ConnectionState state, IPAddress masterIp)> DiscoveryLoop(UdpClient udp)
     {
@@ -173,6 +305,7 @@ internal class Program
         while (true)
         {
             var client = await listener.AcceptTcpClientAsync();
+
             _ = Task.Run(async () =>
             {
                 using (client)
@@ -182,52 +315,117 @@ internal class Program
 
                     try
                     {
+                        // Read one framed JSON message
                         var frame = await ReadFrameAsync(stream, cts.Token);
                         var json = Encoding.UTF8.GetString(frame);
 
-                        var msg = JsonSerializer.Deserialize<DataChunkMessage>(json);
-                        if (msg == null || msg.Type != Shared.Constants.Messages.DataChunkMessageString)
-                            throw new Exception("Invalid message.");
+                        // Determine message type
+                        using var doc = JsonDocument.Parse(json);
+                        if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                            throw new Exception("Message has no Type field.");
 
-                        // Compute hash of received lines exactly
-                        string computed = ComputeSha256OfLines(msg.Lines);
+                        var type = typeProp.GetString();
 
-                        var ack = new DataChunkAckMessage
+                        switch (type)
                         {
-                            JobId = msg.JobId,
-                            ChunkId = msg.ChunkId,
-                            RowCount = msg.Lines?.Length ?? 0,
-                            Sha256 = computed,
-                            Ok = (computed == msg.Sha256) && (msg.RowCount == (msg.Lines?.Length ?? 0)),
-                            Error = ""
-                        };
-
-
-                        if (!ack.Ok)
-                            ack.Error = $"Mismatch: expected hash={msg.Sha256}, got={computed}, expected rows={msg.RowCount}, got={ack.RowCount}";
-
-                        // Store only if OK (so master can trust it’s exact)
-                        if (ack.Ok)
-                        {
-                            lock (_dataLock)
+                            case Shared.Constants.Messages.DataChunkMessageString:
                             {
-                                _currentJobId = msg.JobId;
-                                _receivedChunks[msg.ChunkId] = msg.Lines;
-                            }
-                            Logger.Info($"Received chunk {msg.ChunkId}/{msg.TotalChunks} rows={ack.RowCount}");
-                        }
-                        else
-                        {
-                            Logger.Warn($"Bad chunk {msg.ChunkId}: {ack.Error}");
-                        }
+                                var msg = JsonSerializer.Deserialize<DataChunkMessage>(json);
+                                if (msg == null)
+                                    throw new Exception("Invalid DATA_CHUNK message.");
 
-                        var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
-                        await WriteFrameAsync(stream, ackBytes, cts.Token);
+                                // Compute hash of received lines exactly
+                                string computed = ComputeSha256OfLines(msg.Lines);
+
+                                var ack = new DataChunkAckMessage
+                                {
+                                    JobId = msg.JobId,
+                                    ChunkId = msg.ChunkId,
+                                    RowCount = msg.Lines?.Length ?? 0,
+                                    Sha256 = computed,
+                                    Ok = (computed == msg.Sha256) && (msg.RowCount == (msg.Lines?.Length ?? 0)),
+                                    Error = ""
+                                };
+
+                                if (!ack.Ok)
+                                    ack.Error = $"Mismatch: expected hash={msg.Sha256}, got={computed}, expected rows={msg.RowCount}, got={ack.RowCount}";
+
+                                // Store only if OK
+                                if (ack.Ok)
+                                {
+                                    lock (_dataLock)
+                                    {
+                                        _currentJobId = msg.JobId;
+                                        _receivedChunks[msg.ChunkId] = msg.Lines;
+                                    }
+
+                                    Logger.Info($"Received chunk {msg.ChunkId}/{msg.TotalChunks} rows={ack.RowCount}");
+                                }
+                                else
+                                {
+                                    Logger.Warn($"Bad chunk {msg.ChunkId}: {ack.Error}");
+                                }
+
+                                var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
+                                await WriteFrameAsync(stream, ackBytes, cts.Token);
+                                break;
+                            }
+
+                            case Shared.Constants.Messages.MapRequestMessageString:
+                            {
+                                var req = JsonSerializer.Deserialize<MapRequestMessage>(json);
+                                if (req == null)
+                                    throw new Exception("Invalid MAP_REQUEST message.");
+                                if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId))
+                                    throw new Exception("MAP_REQUEST missing Job.JobId.");
+
+                                // Grab the chunk lines we previously stored from DATA_CHUNK
+                                string[] lines;
+                                lock (_dataLock)
+                                {
+                                    if (!_receivedChunks.TryGetValue(req.ChunkId, out lines!))
+                                        throw new Exception($"Chunk {req.ChunkId} not found on worker.");
+                                }
+
+                                // Run MAP (combiner)
+                                var pairs = MapChunk(req.Job, lines);
+
+                                var res = new MapResultMessage
+                                {
+                                    JobId = req.Job.JobId,
+                                    ChunkId = req.ChunkId,
+                                    Pairs = pairs.ToArray(),
+                                    Ok = true,
+                                    Error = ""
+                                };
+
+                                Logger.Info($"MAP done job={res.JobId} chunk={res.ChunkId} pairs={res.Pairs.Length}");
+
+                                var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
+                                await WriteFrameAsync(stream, resBytes, cts.Token);
+                                break;
+                            }
+
+                            default:
+                                throw new Exception($"Unknown message Type: {type}");
+                        }
                     }
                     catch (Exception ex)
                     {
+                        // If we can, reply with an error in a reasonable format.
+                        // Prefer MAP_RESULT if it *looks* like a map request, else DATA_CHUNK_ACK.
                         try
                         {
+                            string jsonType = "";
+                            try
+                            {
+                                // best-effort parse
+                                using var d = JsonDocument.Parse(Encoding.UTF8.GetString(Array.Empty<byte>()));
+                            }
+                            catch { /* ignore */ }
+
+                            // We don't actually have the original json here anymore in this catch in a robust way,
+                            // so just send a DataChunkAckMessage error (your master already understands it).
                             var ack = new DataChunkAckMessage
                             {
                                 JobId = _currentJobId ?? "",
@@ -235,10 +433,14 @@ internal class Program
                                 Ok = false,
                                 Error = ex.Message
                             };
+
                             var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
                             await WriteFrameAsync(stream, ackBytes, CancellationToken.None);
                         }
-                        catch { /* ignore */ }
+                        catch
+                        {
+                            // ignore if we can't respond
+                        }
 
                         Logger.Error($"JobsListener error: {ex.Message}");
                     }
