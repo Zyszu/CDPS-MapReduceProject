@@ -435,7 +435,16 @@ internal class Program
             sb.AppendLine();
         }
 
-        return sb.ToString();
+        var resultText = sb.ToString();
+
+        var resultsDir = Path.Combine(AppContext.BaseDirectory, "results");
+        Directory.CreateDirectory(resultsDir);
+
+        var filePath = Path.Combine(resultsDir, $"job_{jobId}.txt");
+        await File.WriteAllTextAsync(filePath, resultText);
+
+        return $"Job {jobId} finished. Results written to {filePath}";
+
     }
 
     private static async Task<(string wid, bool ok, string msg, CombinedPair[] pairs)> SendMapRequestToWorkerReturnPairsAsync(
