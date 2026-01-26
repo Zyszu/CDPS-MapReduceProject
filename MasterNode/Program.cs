@@ -15,6 +15,10 @@ internal class Program
     private static readonly object _nodesLock = new();
     private static readonly TimeSpan _heartbeatTimeout = TimeSpan.FromSeconds(7);
     private static readonly string MasterNodeId = NodeIdProvider.GetNodeId();
+    private static volatile string? _lastLoadedJobId = null;
+    private static volatile int _lastLoadedTotalChunks = 0;
+    private static List<Node> _lastLoadedWorkers = new();
+    private static readonly object _jobLock = new();
     
 
     private static async Task Main(string[] args)
@@ -86,7 +90,7 @@ internal class Program
             try
             {
                 await udp.SendAsync(data, data.Length, new IPEndPoint(broadcastIp, Ports.Discovery));
-                Logger.Info("Broadcasted DISCOVER");
+                // Logger.Info("Broadcasted DISCOVER");
             }
             catch (Exception ex)
             {
@@ -137,7 +141,7 @@ internal class Program
             }
 
 
-            Logger.Info($"Heartbeat from {hb.NodeId}[{result.RemoteEndPoint.Address}] at {hb.IpAddress}");
+            // Logger.Info($"Heartbeat from {hb.NodeId}[{result.RemoteEndPoint.Address}] at {hb.IpAddress}");
         }
     }
 
@@ -276,9 +280,121 @@ internal class Program
             case "exit":
                 _requestedQuit = true;
                 return "Exiting...";
+            case "map":
+                int topN = 10;
+                long? fromTs = null;
+                long? toTs = null;
+
+                if (parts.Length >= 2 && int.TryParse(parts[1], out var parsedTopN))
+                    topN = parsedTopN;
+
+                if (parts.Length >= 3 && long.TryParse(parts[2], out var parsedFrom))
+                    fromTs = parsedFrom;
+
+                if (parts.Length >= 4 && long.TryParse(parts[3], out var parsedTo))
+                    toTs = parsedTo;
+
+                return await MapPhaseAsync(topN, fromTs, toTs);
+
 
             default:
                 return $"Unknown command: '{cmd}'. Type 'help'.";
+        }
+    }
+
+    private static async Task<string> MapPhaseAsync(int topN, long? fromTimestamp, long? toTimestamp)
+    {
+        string? jobId;
+        List<Node> workers;
+        int totalChunks;
+
+        lock (_jobLock)
+        {
+            jobId = _lastLoadedJobId;
+            workers = _lastLoadedWorkers.ToList();
+            totalChunks = _lastLoadedTotalChunks;
+        }
+
+        if (string.IsNullOrWhiteSpace(jobId) || workers.Count == 0 || totalChunks == 0)
+            return "No loaded job found. Run 'load' first.";
+
+        // Build JobSpec for MAP
+        var job = new JobSpec
+        {
+            JobId = jobId,
+            TopN = topN,
+            FromTimestamp = fromTimestamp,
+            ToTimestamp = toTimestamp
+        };
+
+        // One MAP request per worker/chunk
+        var tasks = new List<Task<(string workerId, bool ok, string msg, int pairs)>>();
+
+        for (int i = 0; i < workers.Count; i++)
+        {
+            int chunkId = i; // IMPORTANT: must match LoadAndDistributeAsync chunk assignment
+            tasks.Add(SendMapRequestToWorkerAsync(workers[i], job, chunkId));
+        }
+
+        var results = await Task.WhenAll(tasks);
+
+        int okCount = results.Count(r => r.ok);
+        int totalPairs = results.Where(r => r.ok).Sum(r => r.pairs);
+        var errors = results.Where(r => !r.ok).ToList();
+
+        if (errors.Count == 0)
+        {
+            return $"MAP complete for JobId={jobId}. Workers OK: {okCount}/{workers.Count}. Total combined pairs: {totalPairs}.";
+        }
+
+        var errText = string.Join(" | ", errors.Select(e => $"{e.workerId}: {e.msg}"));
+        return $"MAP partial failure for JobId={jobId}. OK: {okCount}/{workers.Count}. TotalPairs(from OK): {totalPairs}. Errors: {errText}";
+    }
+
+    private static async Task<(string workerId, bool ok, string msg, int pairs)> SendMapRequestToWorkerAsync(
+        Node worker,
+        JobSpec job,
+        int chunkId)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+            await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var req = new MapRequestMessage
+            {
+                Job = job,
+                ChunkId = chunkId
+            };
+
+            var json = JsonSerializer.Serialize(req);
+            var bytes = Encoding.UTF8.GetBytes(json);
+
+            await WriteFrameAsync(stream, bytes, cts.Token);
+
+            // Read MAP_RESULT
+            var resFrame = await ReadFrameAsync(stream, cts.Token);
+            var resJson = Encoding.UTF8.GetString(resFrame);
+
+            var res = JsonSerializer.Deserialize<MapResultMessage>(resJson);
+            if (res == null || res.Type != Shared.Constants.Messages.MapResultMessageString)
+                return (worker.Id, false, "Invalid MAP_RESULT.", 0);
+
+            if (!res.Ok)
+                return (worker.Id, false, $"Worker MAP error: {res.Error}", 0);
+
+            if (res.JobId != job.JobId || res.ChunkId != chunkId)
+                return (worker.Id, false, "MAP_RESULT jobId/chunkId mismatch.", 0);
+
+            int pairs = res.Pairs?.Length ?? 0;
+            return (worker.Id, true, "OK", pairs);
+        }
+        catch (Exception ex)
+        {
+            return (worker.Id, false, ex.Message, 0);
         }
     }
 
@@ -309,7 +425,7 @@ internal class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine("Menu: [1] nodes   [2] load   [3] plan   [help]   [q] quit");
+        Console.WriteLine("Menu: [1] nodes   [2] load   [3] plan [map] map [help]   [q] quit");
         Console.WriteLine();
 
         if (!string.IsNullOrWhiteSpace(lastMessage))
@@ -466,7 +582,18 @@ internal class Program
         var errors = results.Where(r => !r.ok).ToList();
 
         if (errors.Count == 0)
+        {
+            // IMPORTANT: remember last successful load so "map" can use it
+            lock (_jobLock)
+            {
+                _lastLoadedJobId = jobId;
+                _lastLoadedTotalChunks = n;
+                _lastLoadedWorkers = workers; // chunkId i was sent to workers[i]
+            }
+
             return $"Loaded {dataLines.Length} rows and distributed to {okCount}/{n} workers. JobId={jobId}";
+        }
+
 
         var errText = string.Join(" | ", errors.Select(e => $"{e.workerId}: {e.msg}"));
         return $"Partial failure: {okCount}/{n} workers OK. Errors: {errText}";
