@@ -25,6 +25,11 @@ internal class Program
         = new();
     private static readonly object _shuffleLock = new();
 
+    // jobId -> userId -> count
+    private static readonly Dictionary<string, Dictionary<int, int>> _shuffleStoreUsers = new();
+    private static readonly object _shuffleUsersLock = new();
+
+
 
     private static async Task Main(string[] args)
     {
@@ -598,9 +603,88 @@ internal class Program
                                     await WriteFrameAsync(stream, resBytes, cts.Token);
                                     break;
                                 }
+                            case Messages.ShuffleUsersPartitionMessageString:
+                                {
+                                    var msg = JsonSerializer.Deserialize<ShuffleUsersPartitionMessage>(json);
+                                    if (msg == null) throw new Exception("Invalid SHUFFLE_USERS_PARTITION.");
+                                    if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("SHUFFLE_USERS_PARTITION missing JobId.");
 
+                                    int received = 0;
+                                    lock (_shuffleUsersLock)
+                                    {
+                                        if (!_shuffleStoreUsers.TryGetValue(msg.JobId, out var store))
+                                        {
+                                            store = new Dictionary<int, int>();
+                                            _shuffleStoreUsers[msg.JobId] = store;
+                                        }
 
+                                        foreach (var p in msg.Pairs ?? Array.Empty<UserCountPair>())
+                                        {
+                                            if (store.TryGetValue(p.UserId, out var c)) store[p.UserId] = c + p.Count;
+                                            else store[p.UserId] = p.Count;
+                                            received++;
+                                        }
+                                    }
 
+                                    var ack = new ShuffleUsersAckMessage
+                                    {
+                                        Type = Messages.ShuffleUsersAckMessageString,
+                                        JobId = msg.JobId,
+                                        ReducerIndex = msg.ReducerIndex,
+                                        ReceivedPairs = received,
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack)), cts.Token);
+                                    break;
+                                }
+                            case Messages.ReduceUsersRequestMessageString:
+                                {
+                                    var req = JsonSerializer.Deserialize<ReduceUsersRequestMessage>(json);
+                                    if (req == null) throw new Exception("Invalid REDUCE_USERS_REQUEST.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("REDUCE_USERS_REQUEST missing JobId.");
+
+                                    var top = ReduceActiveUsers(req.Job.JobId, req.Job.TopN);
+
+                                    var res = new ReduceUsersResultMessage
+                                    {
+                                        Type = Messages.ReduceUsersResultMessageString,
+                                        JobId = req.Job.JobId,
+                                        Top = top.ToArray(),
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res)), cts.Token);
+                                    break;
+                                }
+                            case Messages.MapUsersRequestMessageString:
+                                {
+                                    var req = JsonSerializer.Deserialize<MapUsersRequestMessage>(json);
+                                    if (req == null) throw new Exception("Invalid MAP_USERS_REQUEST.");
+                                    if (string.IsNullOrWhiteSpace(req.DatasetId)) throw new Exception("MAP_USERS_REQUEST missing DatasetId.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("MAP_USERS_REQUEST missing JobId.");
+
+                                    string path;
+                                    lock (_chunkFilesLock)
+                                    {
+                                        if (!_chunkFiles.TryGetValue(req.DatasetId, out var map) || !map.TryGetValue(req.ChunkId, out path!))
+                                            throw new Exception($"Chunk not found on worker. dataset={req.DatasetId} chunk={req.ChunkId}");
+                                    }
+
+                                    var pairs = MapUsersChunkFileStreaming(req.Job, path);
+
+                                    var res = new MapUsersResultMessage
+                                    {
+                                        Type = Messages.MapUsersResultMessageString,
+                                        JobId = req.Job.JobId,
+                                        ChunkId = req.ChunkId,
+                                        Pairs = pairs.ToArray(),
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res)), cts.Token);
+                                    break;
+                                }
                             default:
                                 throw new Exception($"Unknown message Type: {type}");
                         }
@@ -649,6 +733,74 @@ internal class Program
         var baseDir = Path.Combine(AppContext.BaseDirectory, "data", datasetId);
         Directory.CreateDirectory(baseDir);
         return Path.Combine(baseDir, $"chunk_{chunkId}.csvpart");
+    }
+
+
+    private static List<UserCountPair> MapUsersChunkFileStreaming(JobSpec job, string filePath, int maxKeysInMemory = 2_000_000)
+    {
+        var dict = new Dictionary<int, int>();
+
+        using var sr = new StreamReader(filePath);
+        while (true)
+        {
+            var line = sr.ReadLine();
+            if (line == null) break;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var cols = ParseCsvLine(line);
+            if (cols.Length < 6) continue;
+            if (cols[0].Equals("userId", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (!int.TryParse(cols[0], out int userId)) continue;
+            if (!long.TryParse(cols[3], out long ts)) continue;
+
+            if (job.FromTimestamp.HasValue && ts < job.FromTimestamp.Value) continue;
+            if (job.ToTimestamp.HasValue && ts > job.ToTimestamp.Value) continue;
+
+            if (!string.IsNullOrWhiteSpace(job.GenreFilter))
+            {
+                var genresRaw = cols[5] ?? "";
+                if (string.IsNullOrWhiteSpace(genresRaw)) continue;
+
+                bool match = false;
+                foreach (var g in genresRaw.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (g.Equals(job.GenreFilter, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+                if (!match) continue;
+            }
+
+            if (dict.TryGetValue(userId, out var c)) dict[userId] = c + 1;
+            else dict[userId] = 1;
+
+            if (dict.Count > maxKeysInMemory)
+                throw new Exception($"ActiveUsers map exceeded maxKeysInMemory={maxKeysInMemory}. Use smaller chunks or spill-to-disk.");
+        }
+
+        return dict.Select(kv => new UserCountPair { UserId = kv.Key, Count = kv.Value }).ToList();
+    }
+
+    private static List<UserActivity> ReduceActiveUsers(string jobId, int topN)
+    {
+        Dictionary<int, int> data;
+        lock (_shuffleUsersLock)
+        {
+            if (!_shuffleStoreUsers.TryGetValue(jobId, out var stored))
+                return new List<UserActivity>();
+
+            data = new Dictionary<int, int>(stored);
+        }
+
+        return data
+            .Select(kv => new UserActivity { UserId = kv.Key, Count = kv.Value })
+            .OrderByDescending(x => x.Count)
+            .ThenBy(x => x.UserId)
+            .Take(Math.Max(1, topN))
+            .ToList();
     }
 
 

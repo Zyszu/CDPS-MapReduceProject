@@ -281,7 +281,15 @@ internal class Program
             case "help":
             case "h":
             case "?":
-                return "Commands: 1/nodes, 2/load (placeholder), 3/plan (placeholder), clear, help, quit";
+                return
+                    "Commands:\n" +
+                    "  nodes | 1                     Show worker summary\n" +
+                    "  load <csvPath> <linesPerChunk> Stream-load dataset to workers\n" +
+                    "  run topn <N> [fromTs] [toTs]   Top-N movies by avg rating per genre\n" +
+                    "  run activeusers <N> [genre] [fromTs] [toTs]  Most active users (count ratings)\n" +
+                    "  clear | cls                    Clear screen\n" +
+                    "  quit | exit | q                Quit\n" +
+                    "Shortcuts: 1=nodes, 2=load, 3=plan (plan is placeholder)";
 
             case "nodes":
                 return DescribeNodes();
@@ -328,23 +336,56 @@ internal class Program
                 }
             case "run":
                 {
-                    // run topn <N> [fromTs] [toTs]
-                    if (parts.Length < 3)
-                        return "Usage: run topn <N> [fromTs] [toTs]";
+                    if (parts.Length < 3) return "Usage: run topn <N> [fromTs] [toTs] OR run activeusers <N> [genre] [fromTs] [toTs]";
 
                     var op = parts[1].ToLowerInvariant();
-                    if (op != "topn")
-                        return $"Unknown operation '{op}'. (Supported: topn)";
 
-                    if (!int.TryParse(parts[2], out int topN) || topN < 1)
-                        return "topN must be a positive integer.";
+                    if (op == "activeusers")
+                    {
+                        if (_lastLoadedDatasetId == null) return "No dataset loaded. Use load first.";
 
-                    long? fromTs = (parts.Length >= 4 && long.TryParse(parts[3], out var f)) ? f : null;
-                    long? toTs = (parts.Length >= 5 && long.TryParse(parts[4], out var t)) ? t : null;
+                        if (!int.TryParse(parts[2], out int topN) || topN <= 0) return "Invalid N.";
 
-                    return await RunTopNByGenreAsync(topN, fromTs, toTs);
+                        string? genre = null;
+                        long? fromTs = null;
+                        long? toTs = null;
+
+                        // args after N: either [genre] [from] [to] OR [from] [to]
+                        int idx = 3;
+                        if (idx < parts.Length)
+                        {
+                            // If next token is not numeric, treat it as genre
+                            if (!long.TryParse(parts[idx], out _))
+                            {
+                                genre = parts[idx];
+                                idx++;
+                            }
+                        }
+
+                        if (idx < parts.Length && long.TryParse(parts[idx], out var f)) { fromTs = f; idx++; }
+                        if (idx < parts.Length && long.TryParse(parts[idx], out var t)) { toTs = t; idx++; }
+
+                        // Run (blocking) or background – your choice. Here: blocking, simplest:
+                        return await RunMostActiveUsersAsync(topN, genre, fromTs, toTs);
+                    }
+
+                    if (op == "topn")
+                    {
+                        // run topn <N> [fromTs] [toTs]
+                        if (parts.Length < 3)
+                            return "Usage: run topn <N> [fromTs] [toTs]";
+                        if (!int.TryParse(parts[2], out int topN) || topN < 1)
+                            return "topN must be a positive integer.";
+
+                        long? fromTs = (parts.Length >= 4 && long.TryParse(parts[3], out var f)) ? f : null;
+                        long? toTs = (parts.Length >= 5 && long.TryParse(parts[4], out var t)) ? t : null;
+
+                        return await RunTopNByGenreAsync(topN, fromTs, toTs);
+                    }
+                    // ...keep your existing "topn" code here...
+
+                    return $"Unknown run op: {op}";
                 }
-
             case "plan":
                 return "Stage planning is not implemented yet.";
 
@@ -891,7 +932,7 @@ internal class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine("Menu: [1] nodes  [2] load   [3] plan    [map] map    [help] ?    [q] quit");
+        Console.WriteLine("Menu: [1] nodes  [2] load  [run] run topn|activeusers  [help] ?  [q] quit");
         Console.WriteLine();
 
 
@@ -1039,5 +1080,314 @@ internal class Program
             return (_lastLoadedDatasetId, _lastLoadedTotalChunks, new Dictionary<int, Node>(_chunkOwners));
         }
     }
+
+    // -----------------------------
+    // RUN: Most active users
+    // -----------------------------
+
+    private const int MaxShuffleUsersPairsPerFrame = 50_000; // safe batch size; adjust if needed
+
+    private static async Task<string> RunMostActiveUsersAsync(int topN, string? genre, long? fromTs, long? toTs)
+    {
+        // Freeze reducers list once for the run (avoid race w/ heartbeats)
+        var reducers = GetHealthyWorkersSnapshot();
+        if (reducers.Count == 0) return "No healthy workers available.";
+
+        var datasetId = _lastLoadedDatasetId!;
+        int totalChunks = _lastLoadedTotalChunks;
+
+        var jobId = Guid.NewGuid().ToString("N");
+
+        var job = new JobSpec
+        {
+            JobId = jobId,
+            TopN = topN,
+            FromTimestamp = fromTs,
+            ToTimestamp = toTs,
+            GenreFilter = genre
+        };
+
+        // -----------------
+        // MAP phase
+        // -----------------
+        var mapTasks = new List<Task<MapUsersResultMessage>>(capacity: totalChunks);
+
+        for (int chunkId = 0; chunkId < totalChunks; chunkId++)
+        {
+            if (!_chunkOwners.TryGetValue(chunkId, out var owner))
+                return $"Chunk owner not found for chunkId={chunkId}";
+
+            mapTasks.Add(SendMapUsersRequestAsync(owner, datasetId, chunkId, job));
+        }
+
+        MapUsersResultMessage[] mapResults;
+        try
+        {
+            mapResults = await Task.WhenAll(mapTasks);
+        }
+        catch (Exception ex)
+        {
+            return "MAP failed: " + ex.Message;
+        }
+
+        foreach (var mr in mapResults)
+            if (!mr.Ok) return $"MAP failed (chunk {mr.ChunkId}): {mr.Error}";
+
+        // -----------------
+        // SHUFFLE phase (partition by userId)
+        // -----------------
+        // We'll bucket results by reducer index. Each bucket is List<UserCountPair>.
+        int R = reducers.Count;
+        var buckets = new List<UserCountPair>[R];
+        for (int i = 0; i < R; i++) buckets[i] = new List<UserCountPair>(capacity: 1024);
+
+        foreach (var mr in mapResults)
+        {
+            foreach (var p in mr.Pairs ?? Array.Empty<UserCountPair>())
+            {
+                int r = PartitionForUser(p.UserId, R);
+                if ((uint)r >= (uint)R) r = Math.Abs(r) % R;
+                buckets[r].Add(p);
+            }
+        }
+
+        // Send each reducer its bucket, batched to avoid >100MB frames
+        var shuffleTasks = new Task<(bool ok, string msg)>[R];
+
+        for (int r = 0; r < R; r++)
+        {
+            var reducer = reducers[r];
+            var payload = buckets[r].ToArray();
+            shuffleTasks[r] = SendShuffleUsersAsync(reducer, jobId, r, payload);
+        }
+
+        (bool ok, string msg)[] shuffleResults;
+        try
+        {
+            shuffleResults = await Task.WhenAll(shuffleTasks);
+        }
+        catch (Exception ex)
+        {
+            return "SHUFFLE failed: " + ex.Message;
+        }
+
+        for (int r = 0; r < R; r++)
+        {
+            if (!shuffleResults[r].ok)
+                return $"SHUFFLE failed (reducer {r}): {shuffleResults[r].msg}";
+        }
+
+        // -----------------
+        // REDUCE phase
+        // -----------------
+        var reduceTasks = reducers.Select(r => SendReduceUsersAsync(r, job)).ToArray();
+
+        ReduceUsersResultMessage[] reduceResults;
+        try
+        {
+            reduceResults = await Task.WhenAll(reduceTasks);
+        }
+        catch (Exception ex)
+        {
+            return "REDUCE failed: " + ex.Message;
+        }
+
+        foreach (var rr in reduceResults)
+            if (!rr.Ok) return $"REDUCE failed: {rr.Error}";
+
+        // -----------------
+        // FINAL MERGE (global Top-N)
+        // -----------------
+        var merged = new Dictionary<int, int>(); // userId -> count
+        foreach (var rr in reduceResults)
+        {
+            foreach (var u in rr.Top ?? Array.Empty<UserActivity>())
+            {
+                if (merged.TryGetValue(u.UserId, out var c)) merged[u.UserId] = c + u.Count;
+                else merged[u.UserId] = u.Count;
+            }
+        }
+
+        var finalTop = merged
+            .Select(kv => new UserActivity { UserId = kv.Key, Count = kv.Value })
+            .OrderByDescending(x => x.Count)
+            .ThenBy(x => x.UserId)
+            .Take(Math.Max(1, topN))
+            .ToList();
+
+        Directory.CreateDirectory("results");
+        var filePath = Path.Combine("results", $"job_{jobId}_activeusers.txt");
+
+        using (var sw = new StreamWriter(filePath, false, Encoding.UTF8))
+        {
+            sw.WriteLine($"jobId={jobId}");
+            sw.WriteLine($"datasetId={datasetId}");
+            sw.WriteLine($"topN={topN}");
+            sw.WriteLine($"genre={genre ?? "-"}");
+            sw.WriteLine($"fromTs={(fromTs?.ToString() ?? "-")} toTs={(toTs?.ToString() ?? "-")}");
+            sw.WriteLine();
+            int rank = 1;
+            foreach (var u in finalTop)
+            {
+                sw.WriteLine($"{rank,3}. userId={u.UserId} ratings={u.Count}");
+                rank++;
+            }
+        }
+
+        return $"OK. Active users result written to {filePath}";
+    }
+
+    private static int PartitionForUser(int userId, int reducers)
+    {
+        // stable partition: userId -> reducer index
+        // (avoid negative modulo issues)
+        unchecked
+        {
+            int h = userId * 16777619;
+            if (h == int.MinValue) h = 0;
+            h = Math.Abs(h);
+            return (reducers == 0) ? 0 : (h % reducers);
+        }
+    }
+
+    // If you already have a better stable hash, keep yours.
+    // This is just a fallback if you want string keys later.
+    private static int StableHash(string s)
+    {
+        unchecked
+        {
+            int hash = 23;
+            for (int i = 0; i < s.Length; i++)
+                hash = hash * 31 + s[i];
+            return hash;
+        }
+    }
+
+    private static List<Node> GetHealthyWorkersSnapshot()
+    {
+        lock (_nodesLock)
+        {
+            // LostWorkerCheckerLoop already removes timed-out nodes,
+            // so _nodes is effectively the "healthy worker" set.
+            return _nodes.Values.ToList();
+        }
+    }
+
+
+    // -----------------------------
+    // Master -> Worker calls
+    // -----------------------------
+
+    private static async Task<MapUsersResultMessage> SendMapUsersRequestAsync(Node worker, string datasetId, int chunkId, JobSpec job)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var req = new MapUsersRequestMessage
+        {
+            Type = Messages.MapUsersRequestMessageString,
+            DatasetId = datasetId,
+            ChunkId = chunkId,
+            Job = job
+        };
+
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req));
+        await WriteFrameAsync(stream, bytes, cts.Token);
+
+        var frame = await ReadFrameAsync(stream, cts.Token);
+        var json = Encoding.UTF8.GetString(frame);
+
+        var res = JsonSerializer.Deserialize<MapUsersResultMessage>(json);
+        if (res == null) throw new IOException("Invalid MAP_USERS_RESULT JSON.");
+
+        return res;
+    }
+
+    private static async Task<(bool ok, string msg)> SendShuffleUsersAsync(Node reducer, string jobId, int reducerIndex, UserCountPair[] pairs)
+    {
+        try
+        {
+            int total = pairs?.Length ?? 0;
+            int sent = 0;
+
+            while (sent < total)
+            {
+                int take = Math.Min(MaxShuffleUsersPairsPerFrame, total - sent);
+                var batch = new UserCountPair[take];
+                Array.Copy(pairs!, sent, batch, 0, take);
+
+                var one = await SendShuffleUsersBatchAsync(reducer, jobId, reducerIndex, batch);
+                if (!one.ok) return one;
+
+                sent += take;
+            }
+
+            if (total == 0)
+            {
+                var one = await SendShuffleUsersBatchAsync(reducer, jobId, reducerIndex, Array.Empty<UserCountPair>());
+                if (!one.ok) return one;
+            }
+
+            return (true, "OK");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private static async Task<(bool ok, string msg)> SendShuffleUsersBatchAsync(Node reducer, string jobId, int reducerIndex, UserCountPair[] batch)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var msg = new ShuffleUsersPartitionMessage
+        {
+            Type = Messages.ShuffleUsersPartitionMessageString,
+            JobId = jobId,
+            ReducerIndex = reducerIndex,
+            Pairs = batch
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg)), cts.Token);
+
+        var ackFrame = await ReadFrameAsync(stream, cts.Token);
+        var ackJson = Encoding.UTF8.GetString(ackFrame);
+
+        var ack = JsonSerializer.Deserialize<ShuffleUsersAckMessage>(ackJson);
+        if (ack == null) return (false, "Invalid SHUFFLE_USERS_ACK JSON.");
+        if (!ack.Ok) return (false, ack.Error);
+
+        return (true, "OK");
+    }
+
+    private static async Task<ReduceUsersResultMessage> SendReduceUsersAsync(Node reducer, JobSpec job)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var req = new ReduceUsersRequestMessage
+        {
+            Type = Messages.ReduceUsersRequestMessageString,
+            Job = job
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+        var frame = await ReadFrameAsync(stream, cts.Token);
+        var json = Encoding.UTF8.GetString(frame);
+
+        var res = JsonSerializer.Deserialize<ReduceUsersResultMessage>(json);
+        if (res == null) throw new IOException("Invalid REDUCE_USERS_RESULT JSON.");
+
+        return res;
+    }
+
 
 }

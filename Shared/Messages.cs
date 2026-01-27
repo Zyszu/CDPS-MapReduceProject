@@ -51,6 +51,9 @@ public class JobSpec
     public int TopN { get; set; } = 10;
     public long? FromTimestamp { get; set; }
     public long? ToTimestamp { get; set; }
+
+    // For activeusers: optional genre filter (exact match, case-insensitive)
+    public string? GenreFilter { get; set; }
 }
 
 public class CombinedPair
@@ -123,6 +126,69 @@ public class ReduceResultMessage
     public string Type { get; set; } = Messages.ReduceResultMessageString;
     public string JobId { get; set; } = "";
     public GenreTopMovie[] Top { get; set; } = Array.Empty<GenreTopMovie>();
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class UserCountPair
+{
+    public int UserId { get; set; }
+    public int Count { get; set; }
+}
+
+public class MapUsersRequestMessage
+{
+    public string Type { get; set; } = Messages.MapUsersRequestMessageString;
+    public string DatasetId { get; set; } = "";
+    public JobSpec Job { get; set; } = new();
+    public int ChunkId { get; set; }
+}
+
+public class MapUsersResultMessage
+{
+    public string Type { get; set; } = Messages.MapUsersResultMessageString;
+    public string JobId { get; set; } = "";
+    public int ChunkId { get; set; }
+    public UserCountPair[] Pairs { get; set; } = Array.Empty<UserCountPair>();
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class ShuffleUsersPartitionMessage
+{
+    public string Type { get; set; } = Messages.ShuffleUsersPartitionMessageString;
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }
+    public UserCountPair[] Pairs { get; set; } = Array.Empty<UserCountPair>();
+}
+
+public class ShuffleUsersAckMessage
+{
+    public string Type { get; set; } = Messages.ShuffleUsersAckMessageString;
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }
+    public int ReceivedPairs { get; set; }
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class ReduceUsersRequestMessage
+{
+    public string Type { get; set; } = Messages.ReduceUsersRequestMessageString;
+    public JobSpec Job { get; set; } = new();
+}
+
+public class UserActivity
+{
+    public int UserId { get; set; }
+    public int Count { get; set; }
+}
+
+public class ReduceUsersResultMessage
+{
+    public string Type { get; set; } = Messages.ReduceUsersResultMessageString;
+    public string JobId { get; set; } = "";
+    public UserActivity[] Top { get; set; } = Array.Empty<UserActivity>();
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "";
 }
