@@ -49,8 +49,6 @@ public class JobSpec
 {
     public string JobId { get; set; } = "";
     public int TopN { get; set; } = 10;
-
-    // Optional timestamp filter (unix seconds)
     public long? FromTimestamp { get; set; }
     public long? ToTimestamp { get; set; }
 }
@@ -62,17 +60,18 @@ public class CombinedPair
     public double SumRatings { get; set; }
     public int CountRatings { get; set; }
 
-    // Optional but very handy for output
+    // Leave empty to reduce memory/network; resolve titles later if needed
     public string Title { get; set; } = "";
 }
 
 public class MapRequestMessage
 {
     public string Type { get; set; } = Messages.MapRequestMessageString;
-
+    public string DatasetId { get; set; } = "";
     public JobSpec Job { get; set; } = new();
     public int ChunkId { get; set; }
 }
+
 
 public class MapResultMessage
 {
@@ -87,9 +86,8 @@ public class MapResultMessage
 public class ShufflePartitionMessage
 {
     public string Type { get; set; } = Messages.ShufflePartitionMessageString;
-
     public string JobId { get; set; } = "";
-    public int ReducerIndex { get; set; }   // which reducer (0..R-1)
+    public int ReducerIndex { get; set; }
     public CombinedPair[] Pairs { get; set; } = Array.Empty<CombinedPair>();
 }
 
@@ -100,6 +98,7 @@ public class ShuffleAckMessage
     public string JobId { get; set; } = "";
     public int ReducerIndex { get; set; }
     public int ReceivedPairs { get; set; }
+
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "";
 }
@@ -115,7 +114,6 @@ public class GenreTopMovie
 {
     public string Genre { get; set; } = "";
     public int MovieId { get; set; }
-    public string Title { get; set; } = "";
     public double AvgRating { get; set; }
     public int CountRatings { get; set; }
 }
@@ -123,10 +121,8 @@ public class GenreTopMovie
 public class ReduceResultMessage
 {
     public string Type { get; set; } = Messages.ReduceResultMessageString;
-
     public string JobId { get; set; } = "";
     public GenreTopMovie[] Top { get; set; } = Array.Empty<GenreTopMovie>();
-
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "";
 }

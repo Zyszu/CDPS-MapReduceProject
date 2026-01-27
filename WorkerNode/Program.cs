@@ -20,10 +20,9 @@ internal class Program
     private static readonly object _dataLock = new();
     private static volatile string? _currentJobId = null;
 
-    // JobId -> (genre,movieId) -> (sum,count,title)
-    private static readonly Dictionary<string, Dictionary<(string genre, int movieId), (double sum, int count, string title)>> _shuffleStore
+    // jobId -> (genre,movieId) -> (sum,count)
+    private static readonly Dictionary<string, Dictionary<(string genre, int movieId), (double sum, int count)>> _shuffleStore
         = new();
-
     private static readonly object _shuffleLock = new();
 
 
@@ -68,67 +67,6 @@ internal class Program
 
         }
     }
-
-    private static List<GenreTopMovie> ReduceToTopN(string jobId, int topN)
-    {
-        Dictionary<(string genre, int movieId), (double sum, int count, string title)> dict;
-
-        lock (_shuffleLock)
-        {
-            if (!_shuffleStore.TryGetValue(jobId, out var stored))
-                return new List<GenreTopMovie>();
-
-            // Copy so we can release lock quickly
-            dict = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>(stored);
-        }
-
-        // Compute avg per key, then topN per genre
-        var perGenre = new Dictionary<string, List<GenreTopMovie>>();
-
-        foreach (var kv in dict)
-        {
-            var genre = kv.Key.genre;
-            var movieId = kv.Key.movieId;
-            var sum = kv.Value.sum;
-            var count = kv.Value.count;
-            var title = kv.Value.title;
-
-            if (count <= 0) continue;
-
-            var item = new GenreTopMovie
-            {
-                Genre = genre,
-                MovieId = movieId,
-                Title = title,
-                AvgRating = sum / count,
-                CountRatings = count
-            };
-
-            if (!perGenre.TryGetValue(genre, out var list))
-            {
-                list = new List<GenreTopMovie>();
-                perGenre[genre] = list;
-            }
-
-            list.Add(item);
-        }
-
-        var result = new List<GenreTopMovie>();
-
-        foreach (var (genre, list) in perGenre)
-        {
-            var top = list
-                .OrderByDescending(x => x.AvgRating)
-                .ThenByDescending(x => x.CountRatings)
-                .ThenBy(x => x.MovieId)
-                .Take(topN);
-
-            result.AddRange(top);
-        }
-
-        return result;
-    }
-
 
     private static string[] ParseCsvLine(string line)
     {
@@ -181,6 +119,120 @@ internal class Program
         fields.Add(sb.ToString());
         return fields.ToArray();
     }
+
+    private static List<CombinedPair> MapChunkFileStreaming(JobSpec job, string filePath, int maxKeysInMemory = 1_000_000)
+    {
+        var dict = new Dictionary<(string genre, int movieId), (double sum, int count)>();
+
+        using var sr = new StreamReader(filePath);
+
+        while (true)
+        {
+            var line = sr.ReadLine();
+            if (line == null) break;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var cols = ParseCsvLine(line);
+            if (cols.Length < 6) continue;
+            if (cols[0].Equals("userId", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (!int.TryParse(cols[1], out int movieId)) continue;
+
+            if (!double.TryParse(cols[2], System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double rating))
+                continue;
+
+            if (!long.TryParse(cols[3], out long ts)) continue;
+
+            if (job.FromTimestamp.HasValue && ts < job.FromTimestamp.Value) continue;
+            if (job.ToTimestamp.HasValue && ts > job.ToTimestamp.Value) continue;
+
+            var genresRaw = cols[5] ?? "";
+            if (string.IsNullOrWhiteSpace(genresRaw)) continue;
+
+            var genres = genresRaw.Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var genre in genres)
+            {
+                if (genre.Equals("(no genres listed)", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var key = (genre, movieId);
+                if (dict.TryGetValue(key, out var agg))
+                    dict[key] = (agg.sum + rating, agg.count + 1);
+                else
+                    dict[key] = (rating, 1);
+            }
+
+            if (dict.Count > maxKeysInMemory)
+                throw new Exception($"Map exceeded maxKeysInMemory={maxKeysInMemory}. Use smaller chunks or add spill-to-disk.");
+        }
+
+        var res = new List<CombinedPair>(dict.Count);
+        foreach (var kv in dict)
+        {
+            res.Add(new CombinedPair
+            {
+                Genre = kv.Key.genre,
+                MovieId = kv.Key.movieId,
+                SumRatings = kv.Value.sum,
+                CountRatings = kv.Value.count,
+                Title = "" // keep empty to save memory
+            });
+        }
+        return res;
+    }
+
+    private static List<GenreTopMovie> ReduceTopN(string jobId, int topN)
+    {
+        Dictionary<(string genre, int movieId), (double sum, int count)> data;
+
+        lock (_shuffleLock)
+        {
+            if (!_shuffleStore.TryGetValue(jobId, out var stored))
+                return new List<GenreTopMovie>();
+
+            data = new Dictionary<(string genre, int movieId), (double sum, int count)>(stored);
+        }
+
+        var perGenre = new Dictionary<string, List<GenreTopMovie>>();
+
+        foreach (var kv in data)
+        {
+            var genre = kv.Key.genre;
+            var movieId = kv.Key.movieId;
+            var sum = kv.Value.sum;
+            var count = kv.Value.count;
+            if (count <= 0) continue;
+
+            var item = new GenreTopMovie
+            {
+                Genre = genre,
+                MovieId = movieId,
+                AvgRating = sum / count,
+                CountRatings = count
+            };
+
+            if (!perGenre.TryGetValue(genre, out var list))
+            {
+                list = new List<GenreTopMovie>();
+                perGenre[genre] = list;
+            }
+            list.Add(item);
+        }
+
+        var result = new List<GenreTopMovie>();
+        foreach (var list in perGenre.Values)
+        {
+            result.AddRange(list
+                .OrderByDescending(x => x.AvgRating)
+                .ThenByDescending(x => x.CountRatings)
+                .ThenBy(x => x.MovieId)
+                .Take(topN));
+        }
+
+        return result;
+    }
+
 
     private static List<CombinedPair> MapChunk(JobSpec job, string[] lines)
     {
@@ -458,7 +510,7 @@ internal class Program
                             case Shared.Constants.Messages.ShufflePartitionMessageString:
                                 {
                                     var msg = JsonSerializer.Deserialize<ShufflePartitionMessage>(json);
-                                    if (msg == null) throw new Exception("Invalid SHUFFLE_PARTITION message.");
+                                    if (msg == null) throw new Exception("Invalid SHUFFLE_PARTITION.");
                                     if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("SHUFFLE_PARTITION missing JobId.");
 
                                     int received = 0;
@@ -467,18 +519,17 @@ internal class Program
                                     {
                                         if (!_shuffleStore.TryGetValue(msg.JobId, out var store))
                                         {
-                                            store = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>();
+                                            store = new Dictionary<(string genre, int movieId), (double sum, int count)>();
                                             _shuffleStore[msg.JobId] = store;
                                         }
 
                                         foreach (var p in msg.Pairs ?? Array.Empty<CombinedPair>())
                                         {
                                             var key = (p.Genre, p.MovieId);
-
                                             if (store.TryGetValue(key, out var agg))
-                                                store[key] = (agg.sum + p.SumRatings, agg.count + p.CountRatings, string.IsNullOrEmpty(agg.title) ? p.Title : agg.title);
+                                                store[key] = (agg.sum + p.SumRatings, agg.count + p.CountRatings);
                                             else
-                                                store[key] = (p.SumRatings, p.CountRatings, p.Title ?? "");
+                                                store[key] = (p.SumRatings, p.CountRatings);
 
                                             received++;
                                         }
@@ -486,78 +537,69 @@ internal class Program
 
                                     var ack = new ShuffleAckMessage
                                     {
+                                        Type = Shared.Constants.Messages.ShuffleAckMessageString,
                                         JobId = msg.JobId,
                                         ReducerIndex = msg.ReducerIndex,
                                         ReceivedPairs = received,
                                         Ok = true
                                     };
 
-                                    Logger.Info($"SHUFFLE stored job={msg.JobId} reducer={msg.ReducerIndex} received={received}");
-
                                     var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
                                     await WriteFrameAsync(stream, ackBytes, cts.Token);
                                     break;
                                 }
-
                             case Shared.Constants.Messages.ReduceRequestMessageString:
                                 {
                                     var req = JsonSerializer.Deserialize<ReduceRequestMessage>(json);
-                                    if (req == null) throw new Exception("Invalid REDUCE_REQUEST message.");
+                                    if (req == null) throw new Exception("Invalid REDUCE_REQUEST.");
                                     if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("REDUCE_REQUEST missing JobId.");
 
-                                    var top = ReduceToTopN(req.Job.JobId, req.Job.TopN);
+                                    var top = ReduceTopN(req.Job.JobId, req.Job.TopN);
 
                                     var res = new ReduceResultMessage
                                     {
+                                        Type = Shared.Constants.Messages.ReduceResultMessageString,
                                         JobId = req.Job.JobId,
                                         Top = top.ToArray(),
                                         Ok = true
                                     };
 
-                                    Logger.Info($"REDUCE done job={res.JobId} returned={res.Top.Length}");
-
                                     var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
                                     await WriteFrameAsync(stream, resBytes, cts.Token);
                                     break;
                                 }
 
-
                             case Shared.Constants.Messages.MapRequestMessageString:
                                 {
                                     var req = JsonSerializer.Deserialize<MapRequestMessage>(json);
-                                    if (req == null)
-                                        throw new Exception("Invalid MAP_REQUEST message.");
-                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId))
-                                        throw new Exception("MAP_REQUEST missing Job.JobId.");
-
-                                    // TEMP in Phase 1: we use JobId as DatasetId
-                                    var datasetId = req.Job.JobId;
+                                    if (req == null) throw new Exception("Invalid MAP_REQUEST.");
+                                    if (string.IsNullOrWhiteSpace(req.DatasetId)) throw new Exception("MAP_REQUEST missing DatasetId.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("MAP_REQUEST missing JobId.");
 
                                     string path;
                                     lock (_chunkFilesLock)
                                     {
-                                        if (!_chunkFiles.TryGetValue(datasetId, out var map) || !map.TryGetValue(req.ChunkId, out path!))
-                                            throw new Exception($"Chunk file not found. dataset={datasetId}, chunk={req.ChunkId}");
+                                        if (!_chunkFiles.TryGetValue(req.DatasetId, out var map) || !map.TryGetValue(req.ChunkId, out path!))
+                                            throw new Exception($"Chunk not found on worker. dataset={req.DatasetId} chunk={req.ChunkId}");
                                     }
 
-                                    // NOTE: This reads whole chunk into memory. That's OK for now because chunk size is bounded by linesPerChunk.
-                                    var lines = await File.ReadAllLinesAsync(path, cts.Token);
-
-                                    var pairs = MapChunk(req.Job, lines);
+                                    var pairs = MapChunkFileStreaming(req.Job, path);
 
                                     var res = new MapResultMessage
                                     {
+                                        Type = Shared.Constants.Messages.MapResultMessageString,
                                         JobId = req.Job.JobId,
                                         ChunkId = req.ChunkId,
                                         Pairs = pairs.ToArray(),
-                                        Ok = true,
-                                        Error = ""
+                                        Ok = true
                                     };
 
                                     var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
                                     await WriteFrameAsync(stream, resBytes, cts.Token);
                                     break;
                                 }
+
+
 
                             default:
                                 throw new Exception($"Unknown message Type: {type}");
@@ -608,5 +650,6 @@ internal class Program
         Directory.CreateDirectory(baseDir);
         return Path.Combine(baseDir, $"chunk_{chunkId}.csvpart");
     }
+
 
 }

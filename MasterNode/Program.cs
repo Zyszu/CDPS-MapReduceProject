@@ -325,6 +325,25 @@ internal class Program
                     return $"Load started: {path} (linesPerChunk={linesPerChunk})";
 
                 }
+            case "run":
+                {
+                    // run topn <N> [fromTs] [toTs]
+                    if (parts.Length < 3)
+                        return "Usage: run topn <N> [fromTs] [toTs]";
+
+                    var op = parts[1].ToLowerInvariant();
+                    if (op != "topn")
+                        return $"Unknown operation '{op}'. (Supported: topn)";
+
+                    if (!int.TryParse(parts[2], out int topN) || topN < 1)
+                        return "topN must be a positive integer.";
+
+                    long? fromTs = (parts.Length >= 4 && long.TryParse(parts[3], out var f)) ? f : null;
+                    long? toTs = (parts.Length >= 5 && long.TryParse(parts[4], out var t)) ? t : null;
+
+                    return await RunTopNByGenreAsync(topN, fromTs, toTs);
+                }
+
             case "plan":
                 return "Stage planning is not implemented yet.";
 
@@ -337,6 +356,225 @@ internal class Program
                 return $"Unknown command: '{cmd}'. Type 'help'.";
         }
     }
+
+    private static async Task<string> RunTopNByGenreAsync(int topN, long? fromTs, long? toTs)
+    {
+        var (datasetId, totalChunks, owners) = GetLoadedDatasetSnapshot();
+        if (string.IsNullOrWhiteSpace(datasetId) || totalChunks <= 0 || owners.Count == 0)
+            return "No dataset loaded. Run 'load <path> <linesPerChunk>' first.";
+
+        // reducers = all current workers (snapshot)
+        List<Node> reducers;
+        lock (_nodesLock) reducers = _nodes.Values.ToList();
+        if (reducers.Count == 0) return "No workers available for reduce.";
+
+        var jobId = Guid.NewGuid().ToString("N");
+        var job = new JobSpec { JobId = jobId, TopN = topN, FromTimestamp = fromTs, ToTimestamp = toTs };
+
+        int R = reducers.Count;
+        var buckets = new List<CombinedPair>[R];
+        for (int i = 0; i < R; i++) buckets[i] = new List<CombinedPair>(capacity: 1024);
+
+        // MAP each chunk on its owner, partition results into buckets
+        for (int chunkId = 0; chunkId < totalChunks; chunkId++)
+        {
+            if (!owners.TryGetValue(chunkId, out var owner))
+                return $"Missing owner for chunk {chunkId} (dataset state corrupted).";
+
+            var mapRes = await SendMapRequestAsync(owner, datasetId!, job, chunkId);
+            if (!mapRes.ok)
+                return $"MAP failed chunk={chunkId} owner={owner.Id}: {mapRes.msg}";
+
+            foreach (var p in mapRes.pairs)
+            {
+                int idx = PartitionFor(p.Genre, p.MovieId, R);
+                buckets[idx].Add(p);
+            }
+        }
+
+        // SHUFFLE
+        var shuffleTasks = new List<Task<(bool ok, string msg)>>();
+        for (int r = 0; r < R; r++)
+        {
+            var reducer = reducers[r];
+            shuffleTasks.Add(Task.Run(async () =>
+            {
+                var ok = await SendShuffleAsync(reducer, jobId, r, buckets[r].ToArray());
+                return ok;
+            }));
+        }
+
+        var shuffleResults = await Task.WhenAll(shuffleTasks);
+        if (shuffleResults.Any(x => !x.ok))
+            return "SHUFFLE failed: " + string.Join(" | ", shuffleResults.Where(x => !x.ok).Select(x => x.msg));
+
+        // REDUCE
+        var reduceTasks = reducers.Select(r => SendReduceAsync(r, job)).ToArray();
+        var reduceResults = await Task.WhenAll(reduceTasks);
+
+        var bad = reduceResults.Where(x => !x.ok).ToList();
+        if (bad.Count > 0)
+            return "REDUCE failed: " + string.Join(" | ", bad.Select(x => x.msg));
+
+        // FINAL MERGE topN per genre
+        var allTop = reduceResults.SelectMany(x => x.top).ToList();
+        var final = allTop
+            .GroupBy(x => x.Genre)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderByDescending(x => x.AvgRating)
+                      .ThenByDescending(x => x.CountRatings)
+                      .ThenBy(x => x.MovieId)
+                      .Take(topN)
+                      .ToList());
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"Dataset={datasetId} JobId={jobId} TopN={topN} Workers={reducers.Count}");
+        if (fromTs.HasValue || toTs.HasValue)
+            sb.AppendLine($"Time filter: from={fromTs?.ToString() ?? "-"} to={toTs?.ToString() ?? "-"}");
+        sb.AppendLine();
+
+        foreach (var genre in final.Keys.OrderBy(x => x))
+        {
+            sb.AppendLine($"== {genre} ==");
+            int rank = 1;
+            foreach (var item in final[genre])
+            {
+                sb.AppendLine($"{rank,2}. movieId={item.MovieId} avg={item.AvgRating:F3} n={item.CountRatings}");
+                rank++;
+            }
+            sb.AppendLine();
+        }
+
+        // Save result file
+        var resultsDir = Path.Combine(AppContext.BaseDirectory, "results");
+        Directory.CreateDirectory(resultsDir);
+        var filePath = Path.Combine(resultsDir, $"job_{jobId}.txt");
+        await File.WriteAllTextAsync(filePath, sb.ToString());
+
+        return $"OK. Results written to {filePath}";
+    }
+
+    private static async Task<(bool ok, string msg, GenreTopMovie[] top)> SendReduceAsync(Node reducer, JobSpec job)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var req = new ReduceRequestMessage
+            {
+                Type = Messages.ReduceRequestMessageString,
+                Job = job
+            };
+
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+            var resFrame = await ReadFrameAsync(stream, cts.Token);
+            var resJson = Encoding.UTF8.GetString(resFrame);
+
+            using var doc = JsonDocument.Parse(resJson);
+            var type = doc.RootElement.GetProperty("Type").GetString();
+            if (type != Messages.ReduceResultMessageString)
+                return (false, $"Unexpected REDUCE response Type={type}", Array.Empty<GenreTopMovie>());
+
+            var res = JsonSerializer.Deserialize<ReduceResultMessage>(resJson);
+            if (res == null) return (false, "Invalid REDUCE_RESULT JSON.", Array.Empty<GenreTopMovie>());
+            if (!res.Ok) return (false, res.Error, Array.Empty<GenreTopMovie>());
+
+            return (true, "OK", res.Top ?? Array.Empty<GenreTopMovie>());
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message, Array.Empty<GenreTopMovie>());
+        }
+    }
+
+
+    private static async Task<(bool ok, string msg)> SendShuffleAsync(Node reducer, string jobId, int reducerIndex, CombinedPair[] pairs)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var msgObj = new ShufflePartitionMessage
+            {
+                Type = Messages.ShufflePartitionMessageString,
+                JobId = jobId,
+                ReducerIndex = reducerIndex,
+                Pairs = pairs
+            };
+
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msgObj)), cts.Token);
+
+            var ackFrame = await ReadFrameAsync(stream, cts.Token);
+            var ackJson = Encoding.UTF8.GetString(ackFrame);
+
+            using var doc = JsonDocument.Parse(ackJson);
+            var type = doc.RootElement.GetProperty("Type").GetString();
+            if (type != Messages.ShuffleAckMessageString)
+                return (false, $"Unexpected SHUFFLE response Type={type}");
+
+            var ack = JsonSerializer.Deserialize<ShuffleAckMessage>(ackJson);
+            if (ack == null) return (false, "Invalid SHUFFLE_ACK JSON.");
+            if (!ack.Ok) return (false, ack.Error);
+
+            return (true, "OK");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+
+    private static async Task<(bool ok, string msg, CombinedPair[] pairs)> SendMapRequestAsync(Node worker, string datasetId, JobSpec job, int chunkId)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+            using var stream = client.GetStream();
+
+            var req = new MapRequestMessage
+            {
+                Type = Messages.MapRequestMessageString,
+                DatasetId = datasetId,
+                Job = job,
+                ChunkId = chunkId
+            };
+
+            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+            var resFrame = await ReadFrameAsync(stream, cts.Token);
+            var resJson = Encoding.UTF8.GetString(resFrame);
+
+            using var doc = JsonDocument.Parse(resJson);
+            if (!doc.RootElement.TryGetProperty("Type", out var typeProp))
+                return (false, "MAP response missing Type.", Array.Empty<CombinedPair>());
+
+            var type = typeProp.GetString();
+            if (type != Messages.MapResultMessageString)
+                return (false, $"Unexpected MAP response Type={type}", Array.Empty<CombinedPair>());
+
+            var res = JsonSerializer.Deserialize<MapResultMessage>(resJson);
+            if (res == null) return (false, "Invalid MAP_RESULT JSON.", Array.Empty<CombinedPair>());
+            if (!res.Ok) return (false, res.Error, Array.Empty<CombinedPair>());
+
+            return (true, "OK", res.Pairs ?? Array.Empty<CombinedPair>());
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message, Array.Empty<CombinedPair>());
+        }
+    }
+
 
     private static async Task<string> LoadAndDistributeStreamingAsync(string csvPath, int linesPerChunk)
     {
@@ -751,6 +989,14 @@ internal class Program
             offset += size;
         }
         return result;
+    }
+
+    private static (string? datasetId, int totalChunks, Dictionary<int, Node> owners) GetLoadedDatasetSnapshot()
+    {
+        lock (_datasetLock)
+        {
+            return (_lastLoadedDatasetId, _lastLoadedTotalChunks, new Dictionary<int, Node>(_chunkOwners));
+        }
     }
 
 }
