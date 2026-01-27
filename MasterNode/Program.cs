@@ -24,6 +24,24 @@ internal class Program
     private static readonly object _datasetLock = new();
 
 
+
+
+    private static readonly object _loadProgressLock = new();
+    private static volatile bool _loadInProgress = false;
+    private static volatile string _loadStatus = "";
+    private static volatile int _chunksSent = 0;
+    private static volatile int _chunksAcked = 0;
+    private static long _linesSent = 0;
+    private static long _linesAcked = 0;
+    private static volatile string _currentDatasetId = "";
+
+
+
+    private static long _fileTotalBytes = 0;
+    private static long _fileBytesRead = 0;
+
+
+
     private static async Task Main(string[] args)
     {
         Logger.Init("Master");
@@ -277,7 +295,35 @@ internal class Program
                     var path = parts.Length >= 2 ? parts[1] : "./data/out.csv";
                     int linesPerChunk = (parts.Length >= 3 && int.TryParse(parts[2], out var n)) ? n : 20000;
 
-                    return await LoadAndDistributeStreamingAsync(path, linesPerChunk);
+                    if (_loadInProgress)
+                        return "Load already in progress.";
+
+                    _loadInProgress = true;
+                    _loadStatus = "Starting...";
+                    _chunksSent = 0;
+                    _chunksAcked = 0;
+                    _linesSent = 0;
+                    _linesAcked = 0;
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var msg = await LoadAndDistributeStreamingAsync(path, linesPerChunk);
+                            _loadStatus = msg;
+                        }
+                        catch (Exception ex)
+                        {
+                            _loadStatus = "Load failed: " + ex.Message;
+                        }
+                        finally
+                        {
+                            _loadInProgress = false;
+                        }
+                    });
+
+                    return $"Load started: {path} (linesPerChunk={linesPerChunk})";
+
                 }
             case "plan":
                 return "Stage planning is not implemented yet.";
@@ -306,12 +352,18 @@ internal class Program
         if (!File.Exists(csvPath))
             return $"File not found: {csvPath}";
 
+        _fileTotalBytes = new FileInfo(csvPath).Length;
+        Interlocked.Exchange(ref _fileBytesRead, 0);
+
+
         if (linesPerChunk < 1)
             return "linesPerChunk must be >= 1.";
 
         var datasetId = Guid.NewGuid().ToString("N");
         int chunkId = 0;
         int workerIndex = 0;
+
+        _currentDatasetId = datasetId;
 
         using var sr = new StreamReader(csvPath);
 
@@ -330,14 +382,25 @@ internal class Program
             var lines = buffer.ToArray();  // only one chunk at a time -> bounded RAM
             buffer.Clear();
 
+            _chunksSent++;
+            _linesSent += lines.Length;
+            _loadStatus = $"Loading dataset={datasetId}  sentChunks={_chunksSent}  ackedChunks={_chunksAcked}";
+
+
             var res = await SendChunkToWorkerStreamingAsync(worker, datasetId, chunkId, lines);
             if (!res.ok)
                 throw new Exception($"Chunk {chunkId} failed on {worker.Id}: {res.msg}");
+
+            _chunksAcked++;
+            _linesAcked += lines.Length;
+            _loadStatus = $"Loading dataset={datasetId}  sentChunks={_chunksSent}  ackedChunks={_chunksAcked}";
 
             lock (_datasetLock)
             {
                 _chunkOwners[chunkId] = worker;
             }
+
+            _loadStatus = $"Loaded dataset {datasetId}. Chunks={chunkId}. linesPerChunk={linesPerChunk}. Workers={workers.Count}.";
 
             chunkId++;
             workerIndex = (workerIndex + 1) % workers.Count;
@@ -346,6 +409,7 @@ internal class Program
         while (true)
         {
             var line = await sr.ReadLineAsync();
+            Interlocked.Exchange(ref _fileBytesRead, sr.BaseStream.Position);
             if (line == null) break;
 
             buffer.Add(line);
@@ -512,6 +576,15 @@ internal class Program
         }
     }
 
+    private static string Bar(long done, long total, int width = 30)
+    {
+        if (total <= 0) return "[" + new string('-', width) + "]";
+        double frac = Math.Clamp((double)done / total, 0.0, 1.0);
+        int filled = (int)Math.Round(frac * width);
+        return "[" + new string('#', filled) + new string('-', width - filled) + $"] {(frac * 100):0}%";
+    }
+
+
     private static void RenderScreen(string currentInput, string? lastMessage)
     {
         Console.Clear();
@@ -541,6 +614,24 @@ internal class Program
         Console.WriteLine();
         Console.WriteLine("Menu: [1] nodes  [2] load   [3] plan    [map] map    [help] ?    [q] quit");
         Console.WriteLine();
+
+
+        if (_loadInProgress)
+        {
+            long doneBytes = Interlocked.Read(ref _fileBytesRead);
+            long totalBytes = _fileTotalBytes;
+
+            Console.WriteLine($"[LOAD] File progress {Bar(doneBytes, totalBytes)}  {doneBytes}/{totalBytes} bytes");
+            Console.WriteLine($"[LOAD] Chunks: {_chunksAcked}/{_chunksSent}   Lines: {Interlocked.Read(ref _linesAcked)}/{Interlocked.Read(ref _linesSent)}");
+            Console.WriteLine($"[LOAD] Status: {_loadStatus}");
+
+        }
+        else if (!string.IsNullOrWhiteSpace(_loadStatus))
+        {
+            Console.WriteLine($"[LOAD] {_loadStatus}");
+            Console.WriteLine();
+        }
+
 
         if (!string.IsNullOrWhiteSpace(lastMessage))
         {
