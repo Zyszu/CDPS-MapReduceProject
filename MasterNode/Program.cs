@@ -41,6 +41,7 @@ internal class Program
     private static long _fileBytesRead = 0;
 
 
+    private const int MaxShufflePairsPerFrame = 20_000;
 
     private static async Task Main(string[] args)
     {
@@ -504,37 +505,32 @@ internal class Program
         }
     }
 
-
-    private static async Task<(bool ok, string msg)> SendShuffleAsync(Node reducer, string jobId, int reducerIndex, CombinedPair[] pairs)
+    private static async Task<(bool ok, string msg)> SendShuffleAsync(
+        Node reducer, string jobId, int reducerIndex, CombinedPair[] pairs)
     {
         try
         {
-            using var client = new TcpClient();
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
-            await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
-            using var stream = client.GetStream();
+            int total = pairs?.Length ?? 0;
+            int sent = 0;
 
-            var msgObj = new ShufflePartitionMessage
+            while (sent < total)
             {
-                Type = Messages.ShufflePartitionMessageString,
-                JobId = jobId,
-                ReducerIndex = reducerIndex,
-                Pairs = pairs
-            };
+                int take = Math.Min(MaxShufflePairsPerFrame, total - sent);
+                var batch = new CombinedPair[take];
+                Array.Copy(pairs!, sent, batch, 0, take);
 
-            await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msgObj)), cts.Token);
+                var one = await SendShuffleBatchAsync(reducer, jobId, reducerIndex, batch);
+                if (!one.ok) return one;
 
-            var ackFrame = await ReadFrameAsync(stream, cts.Token);
-            var ackJson = Encoding.UTF8.GetString(ackFrame);
+                sent += take;
+            }
 
-            using var doc = JsonDocument.Parse(ackJson);
-            var type = doc.RootElement.GetProperty("Type").GetString();
-            if (type != Messages.ShuffleAckMessageString)
-                return (false, $"Unexpected SHUFFLE response Type={type}");
-
-            var ack = JsonSerializer.Deserialize<ShuffleAckMessage>(ackJson);
-            if (ack == null) return (false, "Invalid SHUFFLE_ACK JSON.");
-            if (!ack.Ok) return (false, ack.Error);
+            // still send an empty batch so reducer creates job entry
+            if (total == 0)
+            {
+                var one = await SendShuffleBatchAsync(reducer, jobId, reducerIndex, Array.Empty<CombinedPair>());
+                if (!one.ok) return one;
+            }
 
             return (true, "OK");
         }
@@ -542,6 +538,39 @@ internal class Program
         {
             return (false, ex.Message);
         }
+    }
+
+    private static async Task<(bool ok, string msg)> SendShuffleBatchAsync(
+        Node reducer, string jobId, int reducerIndex, CombinedPair[] batch)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+        await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var msgObj = new ShufflePartitionMessage
+        {
+            Type = Messages.ShufflePartitionMessageString,
+            JobId = jobId,
+            ReducerIndex = reducerIndex,
+            Pairs = batch
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msgObj)), cts.Token);
+
+        var ackFrame = await ReadFrameAsync(stream, cts.Token);
+        var ackJson = Encoding.UTF8.GetString(ackFrame);
+
+        using var doc = JsonDocument.Parse(ackJson);
+        var type = doc.RootElement.GetProperty("Type").GetString();
+        if (type != Messages.ShuffleAckMessageString)
+            return (false, $"Unexpected SHUFFLE response Type={type}");
+
+        var ack = JsonSerializer.Deserialize<ShuffleAckMessage>(ackJson);
+        if (ack == null) return (false, "Invalid SHUFFLE_ACK JSON.");
+        if (!ack.Ok) return (false, ack.Error);
+
+        return (true, "OK");
     }
 
 
