@@ -1,4 +1,5 @@
-﻿using Shared.Constants;
+﻿// Worker Node
+using Shared.Constants;
 using Shared.Logging;
 using Shared.Messages;
 using Shared.Networking;
@@ -14,7 +15,8 @@ internal class Program
 {
 
     private static readonly string WorkerNodeId = NodeIdProvider.GetNodeId();
-    private static readonly Dictionary<int, string[]> _receivedChunks = new();
+    private static readonly Dictionary<string, Dictionary<int, string>> _chunkFiles = new();
+    private static readonly object _chunkFilesLock = new();
     private static readonly object _dataLock = new();
     private static volatile string? _currentJobId = null;
 
@@ -23,7 +25,6 @@ internal class Program
         = new();
 
     private static readonly object _shuffleLock = new();
-
 
 
     private static async Task Main(string[] args)
@@ -43,7 +44,7 @@ internal class Program
             if (result.state == ConnectionState.SearchingMaster)
             {
                 // run discovery loop and update state
-                
+
                 if (result.state == ConnectionState.CommunicatingMaster)
                 {
                     connectionState = result.state;
@@ -301,10 +302,10 @@ internal class Program
         {
             var hb = new HeartbeatMessage
             {
-                HostName    = Environment.MachineName,
-                NodeId      = WorkerNodeId,
-                IpAddress   = masterIp.ToString(),
-                Timestamp   = DateTime.UtcNow
+                HostName = Environment.MachineName,
+                NodeId = WorkerNodeId,
+                IpAddress = masterIp.ToString(),
+                Timestamp = DateTime.UtcNow
             };
 
             string json = JsonSerializer.Serialize(hb);
@@ -316,7 +317,7 @@ internal class Program
             await Task.Delay(2000); // every 2 seconds
         }
     }
-    
+
 
 
 
@@ -397,149 +398,166 @@ internal class Program
                         switch (type)
                         {
                             case Shared.Constants.Messages.DataChunkMessageString:
-                            {
-                                var msg = JsonSerializer.Deserialize<DataChunkMessage>(json);
-                                if (msg == null)
-                                    throw new Exception("Invalid DATA_CHUNK message.");
-
-                                // Compute hash of received lines exactly
-                                string computed = ComputeSha256OfLines(msg.Lines);
-
-                                var ack = new DataChunkAckMessage
                                 {
-                                    JobId = msg.JobId,
-                                    ChunkId = msg.ChunkId,
-                                    RowCount = msg.Lines?.Length ?? 0,
-                                    Sha256 = computed,
-                                    Ok = (computed == msg.Sha256) && (msg.RowCount == (msg.Lines?.Length ?? 0)),
-                                    Error = ""
-                                };
+                                    var msg = JsonSerializer.Deserialize<DataChunkMessage>(json);
+                                    if (msg == null)
+                                        throw new Exception("Invalid DATA_CHUNK message.");
 
-                                if (!ack.Ok)
-                                    ack.Error = $"Mismatch: expected hash={msg.Sha256}, got={computed}, expected rows={msg.RowCount}, got={ack.RowCount}";
+                                    // Compute hash of received lines exactly
+                                    string computed = ComputeSha256OfLines(msg.Lines);
 
-                                // Store only if OK
-                                if (ack.Ok)
-                                {
-                                    lock (_dataLock)
+                                    var datasetId = string.IsNullOrWhiteSpace(msg.DatasetId) ? msg.JobId : msg.DatasetId;
+
+                                    var ack = new DataChunkAckMessage
                                     {
-                                        _currentJobId = msg.JobId;
-                                        _receivedChunks[msg.ChunkId] = msg.Lines;
+                                        JobId = msg.JobId,
+                                        DatasetId = datasetId,
+                                        ChunkId = msg.ChunkId,
+                                        RowCount = msg.Lines?.Length ?? 0,
+                                        Sha256 = computed,
+                                        Ok = (computed == msg.Sha256) && (msg.RowCount == (msg.Lines?.Length ?? 0)),
+                                        Error = ""
+                                    };
+
+                                    if (!ack.Ok)
+                                        ack.Error = $"Mismatch: expected hash={msg.Sha256}, got={computed}, expected rows={msg.RowCount}, got={ack.RowCount}";
+
+                                    // Store only if OK
+                                    if (ack.Ok)
+                                    {
+                                        var path = GetChunkPath(datasetId, msg.ChunkId);
+
+                                        // Write chunk lines to disk (overwrite per load)
+                                        await File.WriteAllLinesAsync(path, msg.Lines ?? Array.Empty<string>(), cts.Token);
+
+                                        lock (_chunkFilesLock)
+                                        {
+                                            if (!_chunkFiles.TryGetValue(datasetId, out var map))
+                                            {
+                                                map = new Dictionary<int, string>();
+                                                _chunkFiles[datasetId] = map;
+                                            }
+                                            map[msg.ChunkId] = path;
+                                        }
+
+                                        _currentJobId = msg.JobId; // keep if you still use it for error reporting
+
+                                        Logger.Info($"Stored chunk on disk dataset={datasetId} chunk={msg.ChunkId} rows={ack.RowCount} path={path}");
                                     }
 
-                                    Logger.Info($"Received chunk {msg.ChunkId}/{msg.TotalChunks} rows={ack.RowCount}");
-                                }
-                                else
-                                {
-                                    Logger.Warn($"Bad chunk {msg.ChunkId}: {ack.Error}");
-                                }
+                                    else
+                                    {
+                                        Logger.Warn($"Bad chunk {msg.ChunkId}: {ack.Error}");
+                                    }
 
-                                var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
-                                await WriteFrameAsync(stream, ackBytes, cts.Token);
-                                break;
-                            }
+                                    var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
+                                    await WriteFrameAsync(stream, ackBytes, cts.Token);
+                                    break;
+                                }
 
                             case Shared.Constants.Messages.ShufflePartitionMessageString:
-                            {
-                                var msg = JsonSerializer.Deserialize<ShufflePartitionMessage>(json);
-                                if (msg == null) throw new Exception("Invalid SHUFFLE_PARTITION message.");
-                                if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("SHUFFLE_PARTITION missing JobId.");
-
-                                int received = 0;
-
-                                lock (_shuffleLock)
                                 {
-                                    if (!_shuffleStore.TryGetValue(msg.JobId, out var store))
+                                    var msg = JsonSerializer.Deserialize<ShufflePartitionMessage>(json);
+                                    if (msg == null) throw new Exception("Invalid SHUFFLE_PARTITION message.");
+                                    if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("SHUFFLE_PARTITION missing JobId.");
+
+                                    int received = 0;
+
+                                    lock (_shuffleLock)
                                     {
-                                        store = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>();
-                                        _shuffleStore[msg.JobId] = store;
+                                        if (!_shuffleStore.TryGetValue(msg.JobId, out var store))
+                                        {
+                                            store = new Dictionary<(string genre, int movieId), (double sum, int count, string title)>();
+                                            _shuffleStore[msg.JobId] = store;
+                                        }
+
+                                        foreach (var p in msg.Pairs ?? Array.Empty<CombinedPair>())
+                                        {
+                                            var key = (p.Genre, p.MovieId);
+
+                                            if (store.TryGetValue(key, out var agg))
+                                                store[key] = (agg.sum + p.SumRatings, agg.count + p.CountRatings, string.IsNullOrEmpty(agg.title) ? p.Title : agg.title);
+                                            else
+                                                store[key] = (p.SumRatings, p.CountRatings, p.Title ?? "");
+
+                                            received++;
+                                        }
                                     }
 
-                                    foreach (var p in msg.Pairs ?? Array.Empty<CombinedPair>())
+                                    var ack = new ShuffleAckMessage
                                     {
-                                        var key = (p.Genre, p.MovieId);
+                                        JobId = msg.JobId,
+                                        ReducerIndex = msg.ReducerIndex,
+                                        ReceivedPairs = received,
+                                        Ok = true
+                                    };
 
-                                        if (store.TryGetValue(key, out var agg))
-                                            store[key] = (agg.sum + p.SumRatings, agg.count + p.CountRatings, string.IsNullOrEmpty(agg.title) ? p.Title : agg.title);
-                                        else
-                                            store[key] = (p.SumRatings, p.CountRatings, p.Title ?? "");
+                                    Logger.Info($"SHUFFLE stored job={msg.JobId} reducer={msg.ReducerIndex} received={received}");
 
-                                        received++;
-                                    }
+                                    var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
+                                    await WriteFrameAsync(stream, ackBytes, cts.Token);
+                                    break;
                                 }
 
-                                var ack = new ShuffleAckMessage
-                                {
-                                    JobId = msg.JobId,
-                                    ReducerIndex = msg.ReducerIndex,
-                                    ReceivedPairs = received,
-                                    Ok = true
-                                };
-
-                                Logger.Info($"SHUFFLE stored job={msg.JobId} reducer={msg.ReducerIndex} received={received}");
-
-                                var ackBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack));
-                                await WriteFrameAsync(stream, ackBytes, cts.Token);
-                                break;
-                            }
-
                             case Shared.Constants.Messages.ReduceRequestMessageString:
-                            {
-                                var req = JsonSerializer.Deserialize<ReduceRequestMessage>(json);
-                                if (req == null) throw new Exception("Invalid REDUCE_REQUEST message.");
-                                if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("REDUCE_REQUEST missing JobId.");
-
-                                var top = ReduceToTopN(req.Job.JobId, req.Job.TopN);
-
-                                var res = new ReduceResultMessage
                                 {
-                                    JobId = req.Job.JobId,
-                                    Top = top.ToArray(),
-                                    Ok = true
-                                };
+                                    var req = JsonSerializer.Deserialize<ReduceRequestMessage>(json);
+                                    if (req == null) throw new Exception("Invalid REDUCE_REQUEST message.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("REDUCE_REQUEST missing JobId.");
 
-                                Logger.Info($"REDUCE done job={res.JobId} returned={res.Top.Length}");
+                                    var top = ReduceToTopN(req.Job.JobId, req.Job.TopN);
 
-                                var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
-                                await WriteFrameAsync(stream, resBytes, cts.Token);
-                                break;
-                            }
+                                    var res = new ReduceResultMessage
+                                    {
+                                        JobId = req.Job.JobId,
+                                        Top = top.ToArray(),
+                                        Ok = true
+                                    };
+
+                                    Logger.Info($"REDUCE done job={res.JobId} returned={res.Top.Length}");
+
+                                    var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
+                                    await WriteFrameAsync(stream, resBytes, cts.Token);
+                                    break;
+                                }
 
 
                             case Shared.Constants.Messages.MapRequestMessageString:
-                            {
-                                var req = JsonSerializer.Deserialize<MapRequestMessage>(json);
-                                if (req == null)
-                                    throw new Exception("Invalid MAP_REQUEST message.");
-                                if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId))
-                                    throw new Exception("MAP_REQUEST missing Job.JobId.");
-
-                                // Grab the chunk lines we previously stored from DATA_CHUNK
-                                string[] lines;
-                                lock (_dataLock)
                                 {
-                                    if (!_receivedChunks.TryGetValue(req.ChunkId, out lines!))
-                                        throw new Exception($"Chunk {req.ChunkId} not found on worker.");
+                                    var req = JsonSerializer.Deserialize<MapRequestMessage>(json);
+                                    if (req == null)
+                                        throw new Exception("Invalid MAP_REQUEST message.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId))
+                                        throw new Exception("MAP_REQUEST missing Job.JobId.");
+
+                                    // TEMP in Phase 1: we use JobId as DatasetId
+                                    var datasetId = req.Job.JobId;
+
+                                    string path;
+                                    lock (_chunkFilesLock)
+                                    {
+                                        if (!_chunkFiles.TryGetValue(datasetId, out var map) || !map.TryGetValue(req.ChunkId, out path!))
+                                            throw new Exception($"Chunk file not found. dataset={datasetId}, chunk={req.ChunkId}");
+                                    }
+
+                                    // NOTE: This reads whole chunk into memory. That's OK for now because chunk size is bounded by linesPerChunk.
+                                    var lines = await File.ReadAllLinesAsync(path, cts.Token);
+
+                                    var pairs = MapChunk(req.Job, lines);
+
+                                    var res = new MapResultMessage
+                                    {
+                                        JobId = req.Job.JobId,
+                                        ChunkId = req.ChunkId,
+                                        Pairs = pairs.ToArray(),
+                                        Ok = true,
+                                        Error = ""
+                                    };
+
+                                    var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
+                                    await WriteFrameAsync(stream, resBytes, cts.Token);
+                                    break;
                                 }
-
-                                // Run MAP (combiner)
-                                var pairs = MapChunk(req.Job, lines);
-
-                                var res = new MapResultMessage
-                                {
-                                    JobId = req.Job.JobId,
-                                    ChunkId = req.ChunkId,
-                                    Pairs = pairs.ToArray(),
-                                    Ok = true,
-                                    Error = ""
-                                };
-
-                                Logger.Info($"MAP done job={res.JobId} chunk={res.ChunkId} pairs={res.Pairs.Length}");
-
-                                var resBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res));
-                                await WriteFrameAsync(stream, resBytes, cts.Token);
-                                break;
-                            }
 
                             default:
                                 throw new Exception($"Unknown message Type: {type}");
@@ -584,7 +602,11 @@ internal class Program
         }
     }
 
-
-
+    private static string GetChunkPath(string datasetId, int chunkId)
+    {
+        var baseDir = Path.Combine(AppContext.BaseDirectory, "data", datasetId);
+        Directory.CreateDirectory(baseDir);
+        return Path.Combine(baseDir, $"chunk_{chunkId}.csvpart");
+    }
 
 }
