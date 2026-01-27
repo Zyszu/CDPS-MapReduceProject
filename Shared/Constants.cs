@@ -32,4 +32,13 @@ public static class Messages
     public const string ReduceUsersRequestMessageString = "REDUCE_USERS_REQUEST";
     public const string ReduceUsersResultMessageString = "REDUCE_USERS_RESULT";
 
+
+    public const string MapMostReviewedRequestMessageString   = "MAP_MOST_REVIEWED_REQUEST";
+    public const string MapMostReviewedResultMessageString    = "MAP_MOST_REVIEWED_RESULT";
+    public const string ShuffleMostReviewedPartitionMessageString = "SHUFFLE_MOST_REVIEWED_PARTITION";
+    public const string ShuffleMostReviewedAckMessageString   = "SHUFFLE_MOST_REVIEWED_ACK";
+    public const string ReduceMostReviewedRequestMessageString = "REDUCE_MOST_REVIEWED_REQUEST";
+    public const string ReduceMostReviewedResultMessageString  = "REDUCE_MOST_REVIEWED_RESULT";
+
+
 }

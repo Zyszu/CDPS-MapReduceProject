@@ -192,3 +192,68 @@ public class ReduceUsersResultMessage
     public bool Ok { get; set; } = true;
     public string Error { get; set; } = "";
 }
+
+public class MovieAggPair
+{
+    public int MovieId { get; set; }
+    public double Sum { get; set; }
+    public int Count { get; set; }
+}
+
+public class MapMostReviewedRequestMessage
+{
+    public string Type { get; set; } = Messages.MapMostReviewedRequestMessageString;
+    public string DatasetId { get; set; } = "";
+    public int ChunkId { get; set; }
+    public JobSpec Job { get; set; } = new();
+}
+
+public class MapMostReviewedResultMessage
+{
+    public string Type { get; set; } = Messages.MapMostReviewedResultMessageString;
+    public string JobId { get; set; } = "";
+    public int ChunkId { get; set; }
+    public MovieAggPair[] Pairs { get; set; } = Array.Empty<MovieAggPair>();
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class ShuffleMostReviewedPartitionMessage
+{
+    public string Type { get; set; } = Messages.ShuffleMostReviewedPartitionMessageString;
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }
+    public MovieAggPair[] Pairs { get; set; } = Array.Empty<MovieAggPair>();
+}
+
+public class ShuffleMostReviewedAckMessage
+{
+    public string Type { get; set; } = Messages.ShuffleMostReviewedAckMessageString;
+    public string JobId { get; set; } = "";
+    public int ReducerIndex { get; set; }
+    public int ReceivedPairs { get; set; }
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}
+
+public class ReduceMostReviewedRequestMessage
+{
+    public string Type { get; set; } = Messages.ReduceMostReviewedRequestMessageString;
+    public JobSpec Job { get; set; } = new();
+}
+
+public class MovieMostReviewedStat
+{
+    public int MovieId { get; set; }
+    public int Reviews { get; set; }
+    public double Avg { get; set; }
+}
+
+public class ReduceMostReviewedResultMessage
+{
+    public string Type { get; set; } = Messages.ReduceMostReviewedResultMessageString;
+    public string JobId { get; set; } = "";
+    public MovieMostReviewedStat[] Top { get; set; } = Array.Empty<MovieMostReviewedStat>();
+    public bool Ok { get; set; } = true;
+    public string Error { get; set; } = "";
+}

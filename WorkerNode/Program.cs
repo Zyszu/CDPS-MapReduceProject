@@ -29,6 +29,9 @@ internal class Program
     private static readonly Dictionary<string, Dictionary<int, int>> _shuffleStoreUsers = new();
     private static readonly object _shuffleUsersLock = new();
 
+    private static readonly Dictionary<string, Dictionary<int, (double sum, int count)>> _shuffleStoreMostReviewed = new();
+    private static readonly object _shuffleMostReviewedLock = new();
+
 
 
     private static async Task Main(string[] args)
@@ -685,6 +688,90 @@ internal class Program
                                     await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res)), cts.Token);
                                     break;
                                 }
+                            case Messages.MapMostReviewedRequestMessageString:
+                                {
+                                    var req = JsonSerializer.Deserialize<MapMostReviewedRequestMessage>(json);
+                                    if (req == null) throw new Exception("Invalid MAP_MOST_REVIEWED_REQUEST.");
+                                    if (string.IsNullOrWhiteSpace(req.DatasetId)) throw new Exception("Missing DatasetId.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("Missing JobId.");
+
+                                    string path;
+                                    lock (_chunkFilesLock)
+                                    {
+                                        if (!_chunkFiles.TryGetValue(req.DatasetId, out var map) || !map.TryGetValue(req.ChunkId, out path!))
+                                            throw new Exception($"Chunk not found. dataset={req.DatasetId} chunk={req.ChunkId}");
+                                    }
+
+                                    var pairs = MapMostReviewedChunkStreaming(req.Job, path);
+
+                                    var res = new MapMostReviewedResultMessage
+                                    {
+                                        Type = Messages.MapMostReviewedResultMessageString,
+                                        JobId = req.Job.JobId,
+                                        ChunkId = req.ChunkId,
+                                        Pairs = pairs.ToArray(),
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res)), cts.Token);
+                                    break;
+                                }
+                            case Messages.ShuffleMostReviewedPartitionMessageString:
+                                {
+                                    var msg = JsonSerializer.Deserialize<ShuffleMostReviewedPartitionMessage>(json);
+                                    if (msg == null) throw new Exception("Invalid SHUFFLE_MOST_REVIEWED_PARTITION.");
+                                    if (string.IsNullOrWhiteSpace(msg.JobId)) throw new Exception("Missing JobId.");
+
+                                    int received = 0;
+                                    lock (_shuffleMostReviewedLock)
+                                    {
+                                        if (!_shuffleStoreMostReviewed.TryGetValue(msg.JobId, out var store))
+                                        {
+                                            store = new Dictionary<int, (double sum, int count)>();
+                                            _shuffleStoreMostReviewed[msg.JobId] = store;
+                                        }
+
+                                        foreach (var p in msg.Pairs ?? Array.Empty<MovieAggPair>())
+                                        {
+                                            if (store.TryGetValue(p.MovieId, out var agg))
+                                                store[p.MovieId] = (agg.sum + p.Sum, agg.count + p.Count);
+                                            else
+                                                store[p.MovieId] = (p.Sum, p.Count);
+                                            received++;
+                                        }
+                                    }
+
+                                    var ack = new ShuffleMostReviewedAckMessage
+                                    {
+                                        Type = Messages.ShuffleMostReviewedAckMessageString,
+                                        JobId = msg.JobId,
+                                        ReducerIndex = msg.ReducerIndex,
+                                        ReceivedPairs = received,
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(ack)), cts.Token);
+                                    break;
+                                }
+                            case Messages.ReduceMostReviewedRequestMessageString:
+                                {
+                                    var req = JsonSerializer.Deserialize<ReduceMostReviewedRequestMessage>(json);
+                                    if (req == null) throw new Exception("Invalid REDUCE_MOST_REVIEWED_REQUEST.");
+                                    if (req.Job == null || string.IsNullOrWhiteSpace(req.Job.JobId)) throw new Exception("Missing JobId.");
+
+                                    var top = ReduceMostReviewed(req.Job.JobId, req.Job.TopN);
+
+                                    var res = new ReduceMostReviewedResultMessage
+                                    {
+                                        Type = Messages.ReduceMostReviewedResultMessageString,
+                                        JobId = req.Job.JobId,
+                                        Top = top.ToArray(),
+                                        Ok = true
+                                    };
+
+                                    await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(res)), cts.Token);
+                                    break;
+                                }
                             default:
                                 throw new Exception($"Unknown message Type: {type}");
                         }
@@ -803,5 +890,64 @@ internal class Program
             .ToList();
     }
 
+
+    private static List<MovieAggPair> MapMostReviewedChunkStreaming(JobSpec job, string filePath, int maxKeysInMemory = 2_000_000)
+    {
+        var dict = new Dictionary<int, (double sum, int count)>();
+
+        using var sr = new StreamReader(filePath);
+        while (true)
+        {
+            var line = sr.ReadLine();
+            if (line == null) break;
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            var cols = ParseCsvLine(line);
+            if (cols.Length < 6) continue;
+            if (cols[0].Equals("userId", StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (!int.TryParse(cols[1], out int movieId)) continue;
+            if (!double.TryParse(cols[2], System.Globalization.CultureInfo.InvariantCulture, out double rating)) continue;
+            if (!long.TryParse(cols[3], out long ts)) continue;
+
+            if (job.FromTimestamp.HasValue && ts < job.FromTimestamp.Value) continue;
+            if (job.ToTimestamp.HasValue && ts > job.ToTimestamp.Value) continue;
+
+            if (dict.TryGetValue(movieId, out var agg))
+                dict[movieId] = (agg.sum + rating, agg.count + 1);
+            else
+                dict[movieId] = (rating, 1);
+
+            if (dict.Count > maxKeysInMemory)
+                throw new Exception($"MostReviewed map exceeded maxKeysInMemory={maxKeysInMemory}.");
+        }
+
+        return dict.Select(kv => new MovieAggPair { MovieId = kv.Key, Sum = kv.Value.sum, Count = kv.Value.count }).ToList();
+    }
+
+    private static List<MovieMostReviewedStat> ReduceMostReviewed(string jobId, int topN)
+    {
+        Dictionary<int, (double sum, int count)> data;
+        lock (_shuffleMostReviewedLock)
+        {
+            if (!_shuffleStoreMostReviewed.TryGetValue(jobId, out var stored))
+                return new List<MovieMostReviewedStat>();
+
+            data = new Dictionary<int, (double sum, int count)>(stored);
+        }
+
+        return data
+            .Select(kv => new MovieMostReviewedStat
+            {
+                MovieId = kv.Key,
+                Reviews = kv.Value.count,
+                Avg = kv.Value.count == 0 ? 0 : kv.Value.sum / kv.Value.count
+            })
+            .OrderByDescending(x => x.Reviews)
+            .ThenByDescending(x => x.Avg)
+            .ThenBy(x => x.MovieId)
+            .Take(Math.Max(1, topN))
+            .ToList();
+    }
 
 }

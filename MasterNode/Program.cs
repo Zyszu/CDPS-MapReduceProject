@@ -42,6 +42,8 @@ internal class Program
 
 
     private const int MaxShufflePairsPerFrame = 20_000;
+    private const int MaxShuffleMostReviewedPairsPerFrame = 50_000;
+
 
     private static async Task Main(string[] args)
     {
@@ -382,7 +384,20 @@ internal class Program
 
                         return await RunTopNByGenreAsync(topN, fromTs, toTs);
                     }
-                    // ...keep your existing "topn" code here...
+
+                    if (op == "mostreviewed")
+                    {
+                        if (_lastLoadedDatasetId == null) return "No dataset loaded. Use load first.";
+                        if (!int.TryParse(parts[2], out int topN) || topN <= 0) return "Invalid N.";
+
+                        long? fromTs = null;
+                        long? toTs = null;
+                        if (parts.Length >= 4 && long.TryParse(parts[3], out var f)) fromTs = f;
+                        if (parts.Length >= 5 && long.TryParse(parts[4], out var t)) toTs = t;
+
+                        return await RunMostReviewedMoviesAsync(topN, fromTs, toTs);
+                    }
+
 
                     return $"Unknown run op: {op}";
                 }
@@ -1388,6 +1403,243 @@ internal class Program
 
         return res;
     }
+
+    private static async Task<string> RunMostReviewedMoviesAsync(int topN, long? fromTs, long? toTs)
+    {
+        var reducers = GetHealthyWorkersSnapshot();
+        if (reducers.Count == 0) return "No healthy workers available.";
+
+        var datasetId = _lastLoadedDatasetId!;
+        int totalChunks = _lastLoadedTotalChunks;
+
+        var jobId = Guid.NewGuid().ToString("N");
+        var job = new JobSpec
+        {
+            JobId = jobId,
+            TopN = topN,
+            FromTimestamp = fromTs,
+            ToTimestamp = toTs
+        };
+
+        // MAP
+        var mapTasks = new List<Task<MapMostReviewedResultMessage>>(totalChunks);
+        for (int chunkId = 0; chunkId < totalChunks; chunkId++)
+        {
+            if (!_chunkOwners.TryGetValue(chunkId, out var owner))
+                return $"Chunk owner not found for chunkId={chunkId}";
+
+            mapTasks.Add(SendMapMostReviewedAsync(owner, datasetId, chunkId, job));
+        }
+
+        MapMostReviewedResultMessage[] mapResults;
+        try { mapResults = await Task.WhenAll(mapTasks); }
+        catch (Exception ex) { return "MAP failed: " + ex.Message; }
+
+        foreach (var mr in mapResults)
+            if (!mr.Ok) return $"MAP failed (chunk {mr.ChunkId}): {mr.Error}";
+
+        // SHUFFLE: movieId -> reducer
+        int R = reducers.Count;
+        var buckets = new List<MovieAggPair>[R];
+        for (int i = 0; i < R; i++) buckets[i] = new List<MovieAggPair>(1024);
+
+        foreach (var mr in mapResults)
+        {
+            foreach (var p in mr.Pairs ?? Array.Empty<MovieAggPair>())
+            {
+                int r = PartitionForIntKey(p.MovieId, R);
+                buckets[r].Add(p);
+            }
+        }
+
+        var shuffleTasks = new Task<(bool ok, string msg)>[R];
+        for (int r = 0; r < R; r++)
+        {
+            shuffleTasks[r] = SendShuffleMostReviewedAsync(reducers[r], jobId, r, buckets[r].ToArray());
+        }
+
+        (bool ok, string msg)[] shuffleResults;
+        try { shuffleResults = await Task.WhenAll(shuffleTasks); }
+        catch (Exception ex) { return "SHUFFLE failed: " + ex.Message; }
+
+        for (int r = 0; r < R; r++)
+            if (!shuffleResults[r].ok) return $"SHUFFLE failed (reducer {r}): {shuffleResults[r].msg}";
+
+        // REDUCE
+        var reduceTasks = reducers.Select(r => SendReduceMostReviewedAsync(r, job)).ToArray();
+
+        ReduceMostReviewedResultMessage[] reduceResults;
+        try { reduceResults = await Task.WhenAll(reduceTasks); }
+        catch (Exception ex) { return "REDUCE failed: " + ex.Message; }
+
+        foreach (var rr in reduceResults)
+            if (!rr.Ok) return "REDUCE failed: " + rr.Error;
+
+        // FINAL MERGE (safe even if you later change reducers to return partials)
+        var merged = new Dictionary<int, (double sum, int count)>();
+        foreach (var rr in reduceResults)
+        {
+            foreach (var m in rr.Top ?? Array.Empty<MovieMostReviewedStat>())
+            {
+                // rr.Top only includes topN; merge is fine to finalize global topN
+                // (if you want exactness even when N is small, make reducers return more than N or do a full merge)
+                // We'll treat as "approximate global" unless reducers return all keys.
+                merged[m.MovieId] = (m.Avg * m.Reviews, m.Reviews);
+            }
+        }
+
+        var finalTop = merged
+            .Select(kv => new MovieMostReviewedStat
+            {
+                MovieId = kv.Key,
+                Reviews = kv.Value.count,
+                Avg = kv.Value.count == 0 ? 0 : kv.Value.sum / kv.Value.count
+            })
+            .OrderByDescending(x => x.Reviews)
+            .ThenByDescending(x => x.Avg)
+            .ThenBy(x => x.MovieId)
+            .Take(Math.Max(1, topN))
+            .ToList();
+
+        Directory.CreateDirectory("results");
+        var filePath = Path.Combine("results", $"job_{jobId}_mostreviewed.txt");
+        using (var sw = new StreamWriter(filePath, false, Encoding.UTF8))
+        {
+            sw.WriteLine($"jobId={jobId}");
+            sw.WriteLine($"datasetId={datasetId}");
+            sw.WriteLine($"topN={topN}");
+            sw.WriteLine($"fromTs={(fromTs?.ToString() ?? "-")} toTs={(toTs?.ToString() ?? "-")}");
+            sw.WriteLine();
+            int rank = 1;
+            foreach (var m in finalTop)
+            {
+                sw.WriteLine($"{rank,3}. movieId={m.MovieId} reviews={m.Reviews} avg={m.Avg:F3}");
+                rank++;
+            }
+        }
+
+        return $"OK. Most reviewed movies written to {filePath}";
+    }
+
+    private static int PartitionForIntKey(int key, int reducers)
+    {
+        unchecked
+        {
+            int h = key * 16777619;
+            if (h == int.MinValue) h = 0;
+            h = Math.Abs(h);
+            return reducers == 0 ? 0 : (h % reducers);
+        }
+    }
+
+    private static async Task<MapMostReviewedResultMessage> SendMapMostReviewedAsync(Node worker, string datasetId, int chunkId, JobSpec job)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(worker.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var req = new MapMostReviewedRequestMessage
+        {
+            Type = Messages.MapMostReviewedRequestMessageString,
+            DatasetId = datasetId,
+            ChunkId = chunkId,
+            Job = job
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+        var frame = await ReadFrameAsync(stream, cts.Token);
+        var json = Encoding.UTF8.GetString(frame);
+
+        var res = JsonSerializer.Deserialize<MapMostReviewedResultMessage>(json);
+        if (res == null) throw new IOException("Invalid MAP_MOST_REVIEWED_RESULT JSON.");
+        return res;
+    }
+
+    private static async Task<(bool ok, string msg)> SendShuffleMostReviewedAsync(Node reducer, string jobId, int reducerIndex, MovieAggPair[] pairs)
+    {
+        try
+        {
+            int total = pairs?.Length ?? 0;
+            int sent = 0;
+
+            while (sent < total)
+            {
+                int take = Math.Min(MaxShuffleMostReviewedPairsPerFrame, total - sent);
+                var batch = new MovieAggPair[take];
+                Array.Copy(pairs!, sent, batch, 0, take);
+
+                var one = await SendShuffleMostReviewedBatchAsync(reducer, jobId, reducerIndex, batch);
+                if (!one.ok) return one;
+
+                sent += take;
+            }
+
+            if (total == 0)
+            {
+                var one = await SendShuffleMostReviewedBatchAsync(reducer, jobId, reducerIndex, Array.Empty<MovieAggPair>());
+                if (!one.ok) return one;
+            }
+
+            return (true, "OK");
+        }
+        catch (Exception ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
+    private static async Task<(bool ok, string msg)> SendShuffleMostReviewedBatchAsync(Node reducer, string jobId, int reducerIndex, MovieAggPair[] batch)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var msg = new ShuffleMostReviewedPartitionMessage
+        {
+            Type = Messages.ShuffleMostReviewedPartitionMessageString,
+            JobId = jobId,
+            ReducerIndex = reducerIndex,
+            Pairs = batch
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(msg)), cts.Token);
+
+        var ackFrame = await ReadFrameAsync(stream, cts.Token);
+        var ackJson = Encoding.UTF8.GetString(ackFrame);
+
+        var ack = JsonSerializer.Deserialize<ShuffleMostReviewedAckMessage>(ackJson);
+        if (ack == null) return (false, "Invalid SHUFFLE_MOST_REVIEWED_ACK JSON.");
+        if (!ack.Ok) return (false, ack.Error);
+
+        return (true, "OK");
+    }
+
+    private static async Task<ReduceMostReviewedResultMessage> SendReduceMostReviewedAsync(Node reducer, JobSpec job)
+    {
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(300));
+        await client.ConnectAsync(reducer.IpAddress, Ports.Jobs, cts.Token);
+        using var stream = client.GetStream();
+
+        var req = new ReduceMostReviewedRequestMessage
+        {
+            Type = Messages.ReduceMostReviewedRequestMessageString,
+            Job = job
+        };
+
+        await WriteFrameAsync(stream, Encoding.UTF8.GetBytes(JsonSerializer.Serialize(req)), cts.Token);
+
+        var frame = await ReadFrameAsync(stream, cts.Token);
+        var json = Encoding.UTF8.GetString(frame);
+
+        var res = JsonSerializer.Deserialize<ReduceMostReviewedResultMessage>(json);
+        if (res == null) throw new IOException("Invalid REDUCE_MOST_REVIEWED_RESULT JSON.");
+        return res;
+    }
+
 
 
 }
