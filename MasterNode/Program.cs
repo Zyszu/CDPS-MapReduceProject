@@ -363,17 +363,25 @@ internal class Program
         if (string.IsNullOrWhiteSpace(datasetId) || totalChunks <= 0 || owners.Count == 0)
             return "No dataset loaded. Run 'load <path> <linesPerChunk>' first.";
 
-        // reducers = all current workers (snapshot)
+        // Freeze reducers list ONCE (do not read _nodes again during this run)
         List<Node> reducers;
-        lock (_nodesLock) reducers = _nodes.Values.ToList();
-        if (reducers.Count == 0) return "No workers available for reduce.";
+        lock (_nodesLock)
+        {
+            reducers = _nodes.Values.ToList();
+        }
+
+        if (reducers.Count == 0)
+            return "No workers available for reduce.";
+
+        int R = reducers.Count;
+
+        // Buckets size must match R exactly
+        var buckets = new List<CombinedPair>[R];
+        for (int i = 0; i < R; i++)
+            buckets[i] = new List<CombinedPair>(capacity: 1024);
 
         var jobId = Guid.NewGuid().ToString("N");
         var job = new JobSpec { JobId = jobId, TopN = topN, FromTimestamp = fromTs, ToTimestamp = toTs };
-
-        int R = reducers.Count;
-        var buckets = new List<CombinedPair>[R];
-        for (int i = 0; i < R; i++) buckets[i] = new List<CombinedPair>(capacity: 1024);
 
         // MAP each chunk on its owner, partition results into buckets
         for (int chunkId = 0; chunkId < totalChunks; chunkId++)
@@ -388,25 +396,30 @@ internal class Program
             foreach (var p in mapRes.pairs)
             {
                 int idx = PartitionFor(p.Genre, p.MovieId, R);
+
+                // Extra guard to prevent IndexOutOfRange ever crashing the CLI
+                if ((uint)idx >= (uint)R)
+                    return $"PartitionFor returned invalid reducer index idx={idx} with reducers={R}";
+
                 buckets[idx].Add(p);
             }
         }
 
-        // SHUFFLE
-        var shuffleTasks = new List<Task<(bool ok, string msg)>>();
+        // SHUFFLE: IMPORTANT - do not use Task.Run closure here; just create tasks from the async calls
+        var shuffleTasks = new Task<(bool ok, string msg)>[R];
         for (int r = 0; r < R; r++)
         {
             var reducer = reducers[r];
-            shuffleTasks.Add(Task.Run(async () =>
-            {
-                var ok = await SendShuffleAsync(reducer, jobId, r, buckets[r].ToArray());
-                return ok;
-            }));
+            var payload = buckets[r].ToArray();
+
+            shuffleTasks[r] = SendShuffleAsync(reducer, jobId, r, payload)
+                .ContinueWith(t => t.Result);
         }
 
         var shuffleResults = await Task.WhenAll(shuffleTasks);
-        if (shuffleResults.Any(x => !x.ok))
-            return "SHUFFLE failed: " + string.Join(" | ", shuffleResults.Where(x => !x.ok).Select(x => x.msg));
+        var shuffleErrors = shuffleResults.Where(x => !x.ok).ToList();
+        if (shuffleErrors.Count > 0)
+            return "SHUFFLE failed: " + string.Join(" | ", shuffleErrors.Select(x => x.msg));
 
         // REDUCE
         var reduceTasks = reducers.Select(r => SendReduceAsync(r, job)).ToArray();
@@ -446,7 +459,6 @@ internal class Program
             sb.AppendLine();
         }
 
-        // Save result file
         var resultsDir = Path.Combine(AppContext.BaseDirectory, "results");
         Directory.CreateDirectory(resultsDir);
         var filePath = Path.Combine(resultsDir, $"job_{jobId}.txt");
@@ -728,7 +740,7 @@ internal class Program
         unchecked
         {
             int h = 17;
-            h = (h * 31) + genre.GetHashCode(StringComparison.Ordinal);
+            h = (h * 31) + StringComparer.Ordinal.GetHashCode(genre);
             h = (h * 31) + movieId.GetHashCode();
             h = h & 0x7fffffff;
             return h % reducers;
